@@ -128,8 +128,58 @@ function openProject(roomId) {
     return result.json();
   }
 
+  function stopPointerStream(source) {
+    source?.pointerStream?.abort();
+    if (source) source.streamPointers = undefined;
+  }
+
+  async function watchPointers(source) {
+    if (source.pointerStream || Date.now() < (source.retryPointersAt || 0)) return;
+    const controller = new AbortController();
+    source.pointerStream = controller;
+    let watchdog;
+    const arm = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => controller.abort(), 4000);
+    };
+    try {
+      arm();
+      const response = await fetch(api + '/pointers', {
+        headers:{Authorization:'Bearer ' + token}, credentials:'omit', redirect:'error',
+        cache:'no-store', referrerPolicy:'no-referrer', signal:controller.signal,
+      });
+      if (!response.ok || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) return;
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = '';
+      while (!controller.signal.aborted) {
+        const {value, done} = await reader.read();
+        if (done || controller.signal.aborted) break;
+        buffer += value;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const snapshot = JSON.parse(buffer.slice(0,newline));
+          buffer = buffer.slice(newline+1);
+          arm();
+          if (source === bridge && source.mode?.pointers && snapshot.rev === project.rev) {
+            source.streamPointers = snapshot.pointers;
+            showPointers(source, source.streamPointers);
+          }
+        }
+        if (buffer.length > 8192) break;
+      }
+    } catch { /* The live response supplies cursors while the stream reconnects. */ }
+    finally {
+      clearTimeout(watchdog);
+      controller.abort();
+      source.pointerStream = undefined;
+      source.streamPointers = undefined;
+      source.retryPointersAt = Date.now() + 2000;
+    }
+  }
+
   function resetBridge() {
     if (!bridge) return;
+    stopPointerStream(bridge);
     bridge.mode = null;
     bridge.lastSeq = null;
     bridge.port.postMessage({ type: 'sharing', pointers: false, actions: false, actionIds: [], payloads: {} });
@@ -137,6 +187,7 @@ function openProject(roomId) {
 
   function disconnectNetwork(source) {
     if (!source || source !== bridge) return;
+    stopPointerStream(source);
     const mode = source.mode;
     source.lastSeq = null;
     if (!mode?.documentId || !mode.actions) { resetBridge(); return; }
@@ -148,6 +199,7 @@ function openProject(roomId) {
   }
 
   function detach() {
+    stopPointerStream(bridge);
     bridge?.port.close();
     bridge = undefined;
   }
@@ -348,6 +400,21 @@ function openProject(roomId) {
     }
   }
 
+  function showPointers(source, pointers) {
+    const mode = source.mode;
+    const peers = mode.pointers ? pointers.filter(peer =>
+      peer.memberId !== source.selfId && peer.surface === mode.surface && validCoordinates(peer.x, peer.y)
+    ) : [];
+    const editors = source.editors;
+    const editing = new Set(editors.map(peer => peer.memberId));
+    const markers = peers.map(peer => ({ ...peer, editing: editing.has(peer.memberId) }));
+    // A room editing lease carries only identity. It has no dependency on pointer sharing.
+    for (const { memberId, name } of editors) {
+      if (!peers.some(peer => peer.memberId === memberId)) markers.push({ memberId, name, editing: true });
+    }
+    source.port.postMessage({ type: 'pointers', peers: markers });
+  }
+
   async function applyLive(source, state) {
     const config = project.config;
     const previous = source.mode;
@@ -397,17 +464,11 @@ function openProject(roomId) {
     }
     source.lastSeq = Math.max(source.lastSeq, head);
 
-    const peers = mode.pointers ? state.pointers.filter(peer =>
-      peer.memberId !== state.self.id && peer.surface === mode.surface && validCoordinates(peer.x, peer.y)
-    ) : [];
-    const editors = (state.editing || []).filter(peer => peer.memberId !== state.self.id);
-    const editing = new Set(editors.map(peer => peer.memberId));
-    const markers = peers.map(peer => ({ ...peer, editing: editing.has(peer.memberId) }));
-    // A room editing lease carries only identity. It has no dependency on pointer sharing.
-    for (const { memberId, name } of editors) {
-      if (!peers.some(peer => peer.memberId === memberId)) markers.push({ memberId, name, editing: true });
-    }
-    source.port.postMessage({ type: 'pointers', peers: markers });
+    source.selfId = state.self.id;
+    source.editors = (state.editing || []).filter(peer => peer.memberId !== source.selfId);
+    if (mode.pointers) void watchPointers(source);
+    else stopPointerStream(source);
+    showPointers(source, source.streamPointers || state.pointers);
 
     if (source.documentId !== documentId) {
       source.documentId = documentId;

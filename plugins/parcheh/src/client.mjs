@@ -4,15 +4,31 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
-import { homedir, networkInterfaces } from 'node:os';
+import { homedir, networkInterfaces, userInfo } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { checkSourceRoot } from './project-tree.mjs';
 import { draftFiles } from './desktop-draft.mjs';
+import { invalidDisplayName, normalizeDisplayName } from './display-name.mjs';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const token = /^[A-Za-z0-9_-]{16,256}$/;
 const isTree = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+
+function localDisplayName() {
+  let username;
+  try { username = userInfo().username; }
+  catch { return 'Participant'; }
+  if (/^(?:root|nobody|daemon|system|service|runner|administrator)$/i.test(username)) return 'Participant';
+  return /^[\p{L}\p{N}][\p{L}\p{N}._-]{0,39}$/u.test(username) ? username : 'Participant';
+}
+
+function entryDisplayName(value) {
+  if (value === undefined) return localDisplayName();
+  const name = normalizeDisplayName(value);
+  if (!name) throw new Error(invalidDisplayName);
+  return name;
+}
 
 function inside(root, path) {
   const rel = relative(root, path);
@@ -342,7 +358,8 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return local;
   }
 
-  async function start_room({ source, workspaceParent, displayName = 'Host', pointers, actions, openPreview }, progress = () => {}) {
+  async function start_room({ source, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
+    const name = entryDisplayName(displayName);
     const selected = await chooseSource(source);
     if (inside(selected, home) || inside(home, selected)) throw new Error('The source must exclude PARCHEH_HOME.');
     const parent = await chooseWorkspace(workspaceParent);
@@ -362,7 +379,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     }
     const { launchHost: startHost } = await import('./room-process.mjs');
     const host = await startHost({
-      source: selected, displayName, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
+      source: selected, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
       releaseDirectory: env.PARCHEH_RELEASE_DIR || fileURLToPath(new URL('../dist/desktop/', import.meta.url)),
     });
     try {
@@ -380,7 +397,8 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     }
   }
 
-  async function join_room({ inviteUrl, workspaceParent, displayName = 'Guest-' + randomUUID().slice(0, 6), pointers, actions, openPreview }, progress = () => {}) {
+  async function join_room({ inviteUrl, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
+    const name = entryDisplayName(displayName);
     const { room, origin, inviteSecret } = parseInvite(inviteUrl, allowLanHttp);
     const parent = await chooseWorkspace(workspaceParent);
     progress(15, 'Invite checked');
@@ -401,7 +419,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     const fingerprint = createHash('sha256').update(inviteUrl).digest('hex');
     let pending = await readJson(pendingPath);
     if (!pending || pending.fingerprint !== fingerprint) {
-      pending = { fingerprint, displayName, requestId:randomUUID() };
+      pending = { fingerprint, displayName: name, requestId:randomUUID() };
     }
     pending.sharing ??= {};
     if (pointers !== undefined) pending.sharing.pointers = pointers;

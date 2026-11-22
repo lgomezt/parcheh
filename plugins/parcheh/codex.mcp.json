@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "parcheh": {
+      "type": "stdio",
+      "command": "/bin/sh",
+      "args": [
+        "./launch-mcp.sh"
+      ],
+      "cwd": ".",
+      "env": {
+        "PARCHEH_DESKTOP": "1",
+        "PARCHEH_ALLOW_LAN_HTTP": "1"
+      }
+    }
+  }
+}

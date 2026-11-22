@@ -1,0 +1,15 @@
+{
+  "name": "parcheh",
+  "version": "0.2.6",
+  "description": "Collaborate on one project from your own coding agent, with live edits and shared cursors.",
+  "author": {
+    "name": "parcheh"
+  },
+  "skills": "./codex-skills/",
+  "mcpServers": "./codex.mcp.json",
+  "interface": {
+    "displayName": "parcheh",
+    "shortDescription": "Collaborate on one project from your own coding agent, with live edits and shared cursors.",
+    "category": "Productivity"
+  }
+}

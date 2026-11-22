@@ -48,6 +48,7 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
   let peers = [];
   let overlay;
   const markers = new Map();
+  const cursorColors = ['#6941c6', '#006b75', '#b23d1a', '#a12a72'];
   const listeners = new AbortController();
   const { signal } = listeners;
   const bridge = { origin: expected, stage, disconnect };
@@ -91,14 +92,18 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
       overlay = layer.attachShadow({ mode: 'open' });
       const css = document.createElement('style');
       css.textContent = `
-        [data-parcheh-peer] { position:fixed; left:0; top:0; background:#28553f; color:white;
-          padding:2px 6px; border-radius:4px; font:12px system-ui; white-space:nowrap;
+        [data-parcheh-peer] { position:fixed; left:0; top:0; color:var(--cursor-color,#6941c6);
           pointer-events:none; will-change:transform; }
-        [data-moving] { transition:transform 150ms linear; }
-        [data-editing]::after { content:''; display:inline-block; width:8px; height:8px; margin-left:5px;
+        svg { display:none; width:17px; height:21px; filter:drop-shadow(0 1px 1px #0005); }
+        [data-positioned] svg { display:block; }
+        .name { display:block; width:max-content; background:var(--cursor-color,#6941c6); color:white;
+          border-radius:5px; padding:3px 7px; font:600 12px/15px system-ui; white-space:nowrap; }
+        [data-positioned] .name { margin:-4px 0 0 12px; }
+        [data-moving] { transition:transform 55ms linear; }
+        [data-editing] .name::after { content:''; display:inline-block; width:8px; height:8px; margin-left:5px;
           border:1.5px solid #ffffff70; border-top-color:white; border-radius:50%; animation:spin .8s linear infinite; }
         @keyframes spin { to { transform:rotate(360deg) } }
-        @media (prefers-reduced-motion: reduce) { [data-moving] { transition:none; } [data-editing]::after { animation:none; } }
+        @media (prefers-reduced-motion: reduce) { [data-moving] { transition:none; } [data-editing] .name::after { animation:none; } }
       `;
       overlay.append(css);
       document.documentElement.append(layer);
@@ -110,6 +115,19 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
       if (!marker) {
         marker = document.createElement('span');
         marker.dataset.parchehPeer = peer.memberId;
+        const ns = 'http://www.w3.org/2000/svg';
+        const arrow = document.createElementNS(ns,'svg');
+        arrow.setAttribute('viewBox','0 0 17 21');
+        arrow.setAttribute('aria-hidden','true');
+        const path = document.createElementNS(ns,'path');
+        path.setAttribute('d','M1 1L15.5 11.8L9 12.5L6 19Z');
+        path.setAttribute('fill','currentColor');
+        path.setAttribute('stroke','white');
+        path.setAttribute('stroke-linejoin','round');
+        arrow.append(path);
+        const label = document.createElement('span');
+        label.className = 'name';
+        marker.append(arrow,label);
         overlay.append(marker);
         markers.set(peer.memberId, marker);
       }
@@ -120,7 +138,9 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
       const y = bounds.top + (positioned ? peer.y * bounds.height : 8 + 22 * corner++);
       marker.style.transform = `translate(${x}px, ${y}px)`;
       marker.toggleAttribute('data-editing', peer.editing === true);
-      marker.textContent = `${positioned ? '↖ ' : ''}${peer.name}${peer.editing ? ' · Editing' : ''}`;
+      if (cursorColors[peer.colorIndex]) marker.style.setProperty('--cursor-color',cursorColors[peer.colorIndex]);
+      const label = `${peer.name}${peer.editing ? ' · Editing' : ''}`;
+      if (marker.lastChild.textContent !== label) marker.lastChild.textContent = label;
     }
   }
 
@@ -220,8 +240,8 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
       port?.postMessage(nextPointer);
       nextPointer = null;
     };
-    if (now - lastPointer >= 50) emit();
-    else pointerTimer = setTimeout(emit, 50 - (now - lastPointer));
+    if (now - lastPointer >= 32) emit();
+    else pointerTimer = setTimeout(emit, 32 - (now - lastPointer));
   }
 
   function publish(actionId, payload, event) {

@@ -5,7 +5,10 @@ import { openClient } from './client.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 
 const path = { type: 'string', minLength: 1 };
-const name = { type: 'string', minLength: 1 };
+const name = {
+  type: 'string', minLength: 1,
+  description: "Name visible in the room. Use the name the user requests. Otherwise use an already-known human profile name if it fits: up to 40 characters, beginning with a letter or number, using letters, numbers, spaces, periods, underscores, apostrophes or hyphens. Omit if unknown or unsuitable.",
+};
 const room = { type: 'string', format: 'uuid' };
 const browserOptions = {
   pointers:{type:'boolean',description:'The room shares the project cursor on entry. Set false to keep it private.'},

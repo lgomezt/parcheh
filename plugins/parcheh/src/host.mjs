@@ -7,10 +7,12 @@ import { dirname, join, resolve } from 'node:path';
 import { openDocumentStore } from './document-store.mjs';
 import { createHistory, scanTree } from './project.mjs';
 import { projectAsset, projectAssetBytes, projectAssetPolicy } from './project-assets.mjs';
+import { invalidDisplayName, normalizeDisplayName } from './display-name.mjs';
 
 const assets = new Map([
   ['/project.js', 'project.js'],
   ['/invite.mjs', 'invite.mjs'],
+  ['/display-name.mjs', new URL('./display-name.mjs', import.meta.url)],
   ['/join.js', 'join.js'],
   ['/app-bridge.mjs', 'app-bridge.mjs'],
 ]);
@@ -22,7 +24,6 @@ const downloads = new Set([
 ]);
 const token = () => randomBytes(32).toString('base64url');
 const fail = (status, message) => Object.assign(new Error(message), {status});
-const namePattern = /^[\p{L}\p{N}][\p{L}\p{N} ._'-]{0,39}$/u;
 const identifier = /^[a-z][a-z0-9-]{0,47}$/;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PEER_TIMEOUT = 3500;
@@ -33,12 +34,16 @@ const MAX_SUBMIT_BYTES = 184 * MiB;
 const MAX_BULK_BYTES = 256 * MiB;
 const MAX_BULK_REQUESTS = 8;
 const TRANSFER_TIMEOUT = 30_000;
+const MAX_INVITE_PREVIEW_BYTES = 512 * 1024;
+const MAX_INVITE_PREVIEW_SIDE = 1200;
+const pngSignature = Buffer.from('89504e470d0a1a0a', 'hex');
 const actionPayloads = new Map([['point', ['x','y']], ['segment', ['x','y','x2','y2']]]);
 const unit = (value) => Number.isFinite(value) && value>=0 && value<=1;
 
 function nameOf(value) {
-  if (typeof value !== 'string' || !namePattern.test(value.trim())) throw fail(400,'Choose a name of up to 40 characters.');
-  return value.trim();
+  const name = normalizeDisplayName(value);
+  if (!name) throw fail(400, invalidDisplayName);
+  return name;
 }
 function fields(value, required, optional=[]) {
   if (!value || Array.isArray(value) || typeof value!=='object' ||
@@ -106,9 +111,24 @@ function shareConfig(tree) {
           ops.some(op=>!actions.includes(op) || !Object.hasOwn(payloads,op))) return null;
       document={id,actions:ops};
     }
-    return {surface:v.surface,actions,payloads,...(document && {document})};
+    const invitePreview = typeof v.invitePreview === 'string' ? v.invitePreview : null;
+    return {surface:v.surface,actions,payloads,...(document && {document}),...(invitePreview && {invitePreview})};
   } catch { return null; }
 }
+function invitePreviewBytes(tree, path) {
+  if (!path) return null;
+  let file;
+  try { file = projectAsset(tree, path.split('/').map(encodeURIComponent).join('/')); }
+  catch { return null; }
+  if (file?.type !== 'image/png' || file.data.length > Math.ceil(MAX_INVITE_PREVIEW_BYTES / 3) * 4) return null;
+  const bytes = projectAssetBytes(file);
+  if (bytes.length < 45 || bytes.length > MAX_INVITE_PREVIEW_BYTES ||
+      !bytes.subarray(0, 8).equals(pngSignature) || bytes.readUInt32BE(8) !== 13 ||
+      bytes.toString('ascii', 12, 16) !== 'IHDR') return null;
+  const width = bytes.readUInt32BE(16), height = bytes.readUInt32BE(20);
+  return width > 0 && height > 0 && width <= MAX_INVITE_PREVIEW_SIDE && height <= MAX_INVITE_PREVIEW_SIDE ? bytes : null;
+}
+
 function validatedPayload(config, actionId, payload) {
   const coordinates=actionPayloads.get(config.payloads[actionId]);
   fields(payload,coordinates);
@@ -117,7 +137,7 @@ function validatedPayload(config, actionId, payload) {
 }
 
 async function asset(res, file, type, policy) {
-  const data=await readFile(new URL('../web/v2/'+file,import.meta.url));
+  const data=await readFile(new URL(file, new URL('../web/v2/', import.meta.url)));
   res.writeHead(200,{'content-type':type+'; charset=utf-8','content-security-policy':policy});
   res.end(data);
 }
@@ -179,6 +199,34 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   const members=[], grants=new Map(), pointers=new Map(), lastSeen=new Map(), actions=[];
   const sharingByMember=new Map(), editing=new Map(), joinReceipts=new Map();
   const inviteUrl=()=>baseUrl+'/r/'+roomId+'#'+inviteSecret;
+  const pointerStreams = new Set();
+  function visiblePointers(member, now = Date.now()) {
+    if (!sharingByMember.get(member.id).sharing.pointers) return [];
+    return [...pointers.values()].filter(p => p.memberId !== member.id && p.surface === appSurface()
+      && now-p.at < POINTER_TIMEOUT && now-(lastSeen.get(p.memberId) ?? 0) < PEER_TIMEOUT)
+      .map(({at, ...pointer}) => pointer);
+  }
+  function publishPointers() {
+    for (const client of pointerStreams) client.send();
+  }
+  function streamPointers(member, res) {
+    if ([...pointerStreams].filter(client => client.id === member.id).length >= 2)
+      throw fail(429,'Too many cursor streams.');
+    res.writeHead(200, {'content-type':'application/x-ndjson', 'x-accel-buffering':'no'});
+    let blocked = false, last;
+    const client = {id:member.id, send(heartbeat = false) {
+      if (blocked || res.destroyed) return;
+      const snapshot = JSON.stringify({rev:current.rev, pointers:visiblePointers(member)});
+      if (last === snapshot && !heartbeat) return;
+      last = snapshot;
+      // A slow connection retains only its current write. Drain samples fresh room state.
+      blocked = !res.write(snapshot + '\n');
+    }};
+    pointerStreams.add(client);
+    res.on('drain', () => { blocked = false; client.send(); });
+    res.once('close', () => pointerStreams.delete(client));
+    client.send();
+  }
   function documentAccess(member,id) {
     if(!sharingByMember.get(member.id).sharing.actions) throw fail(403,'Action sharing is off.');
     if(!config?.document || id!==config.document.id) throw fail(409,'Unknown or changed shared document.');
@@ -189,8 +237,12 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   const appSurface=()=> 'app:'+(config?.surface ?? 'page')+':'+current.rev;
   function addMember(name) {
     if (members.length>=4) throw fail(409,'Room is full.');
-    if (members.some(m=>m.name.toLowerCase()===name.toLowerCase())) throw fail(409,'Name already in use in this room.');
-    const member={id:randomUUID(),name};
+    let label = name;
+    for (let number = 2; members.some(m => m.name.toLowerCase() === label.toLowerCase()); number++) {
+      const suffix = ' ' + number;
+      label = Array.from(name).slice(0, 40 - suffix.length).join('').trimEnd() + suffix;
+    }
+    const member={id:randomUUID(),name:label};
     const memberToken=token(), browserToken=token();
     members.push(member); grants.set(memberToken,{member,role:'editor'});
     sharingByMember.set(member.id,{sharing:{pointers:true,actions:true},sharingEpoch:0,sharingActionSeq:sequence});
@@ -202,6 +254,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       fields(msg,['kind']);
       pointers.delete(member.id);
       if(msg.kind==='leave') lastSeen.delete(member.id);
+      publishPointers();
       return;
     }
     if (msg?.surface!==appSurface()) throw fail(400,'Unknown or stale shared surface.');
@@ -212,7 +265,8 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       if (!unit(msg.x) || !unit(msg.y)) throw fail(400,'Invalid pointer.');
       if (!sharing.pointers) throw fail(403,'Pointer sharing is off.');
       lastSeen.set(member.id,Date.now());
-      pointers.set(member.id,{...event,x:msg.x,y:msg.y,at:Date.now()});
+      pointers.set(member.id,{...event,colorIndex:members.indexOf(member),x:msg.x,y:msg.y,at:Date.now()});
+      publishPointers();
       return;
     }
     if (msg.kind!=='action' || !config?.actions.includes(msg.actionId) || config.document?.actions.includes(msg.actionId)) {
@@ -237,6 +291,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       sharingActionSeq:sharing.actions&&!prior.sharing.actions ? sequence : prior.sharingActionSeq,
     });
     if(!sharing.pointers) pointers.delete(member.id);
+    publishPointers();
     return {sharing};
   }
 
@@ -272,7 +327,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       }
       if(req.headers.origin && ![baseUrl,localBaseUrl].includes(req.headers.origin)) throw fail(403,'Unknown origin.');
       if(req.method==='GET') {
-        if(path==='/r/'+roomId) return await asset(res,'join.html','text/html',shellPolicy);
+        if(path==='/r/'+roomId) return await asset(res,'join.html','text/html',shellPolicy + '; img-src blob:');
         if (path === '/downloads') {
           const files = releaseDirectory ? await Promise.all([...downloads].map(async name => {
             const stat = await lstat(join(releaseDirectory, name)).catch(() => null);
@@ -299,6 +354,15 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
         if(path==='/view/'+roomId) return await asset(res,'project.html','text/html',shellPolicy);
         if(assets.has(path)) return await asset(res,assets.get(path),'text/javascript',shellPolicy);
       }
+      if (req.method === 'GET' && /^\/api\/rooms\/[^/]+\/invite-preview$/.test(path)) {
+        const secret = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+        if (path !== '/api/rooms/' + roomId + '/invite-preview' ||
+            Date.now() > expires || !sameSecret(secret, inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+        const preview = invitePreviewBytes(current.tree, config?.invitePreview);
+        if (!preview) return res.writeHead(204).end();
+        holdResponse(res, preview.length);
+        return res.writeHead(200, {'content-type':'image/png','content-length':preview.length}).end(preview);
+      }
       const prefix='/api/rooms/'+roomId+'/';
       if (!path.startsWith(prefix)) throw fail(404,'Unknown room or endpoint.');
       const route=path.slice(prefix.length);
@@ -318,7 +382,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       }
       const grant=grants.get((req.headers.authorization||'').replace(/^Bearer /,''));
       if (!req.headers.authorization?.startsWith('Bearer ')||!grant) throw fail(403,'Room credential required.');
-      const browser=['activity','live','config','document','invite'].includes(route);
+      const browser=['activity','live','pointers','config','document','invite'].includes(route);
       if (grant.role!==(browser?'browser':'editor')) throw fail(403,'Wrong credential for this operation.');
       if (req.method==='GET') {
         if(route==='snapshot') {
@@ -340,6 +404,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
           browserMode:entryUrl() ? 'project' : 'source-only',sharing:settings.sharing,
         });
         if(route==='config') return json({rev:current.rev,config,entryUrl:entryUrl(),sharing:settings.sharing});
+        if(route==='pointers') return streamPointers(grant.member,res);
         if(route==='live') {
           const now=Date.now();
           const surface=appSurface();
@@ -352,8 +417,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
             documentHead:settings.sharing.actions && config?.document ? documentStore().head(config.document.id) : 0,
             editing:members.filter(m=>editing.has(m.id)).map(m=>({memberId:m.id,name:m.name})),
             actions:settings.sharing.actions ? actions.filter(e=>e.seq>settings.sharingActionSeq && e.surface===surface) : [],
-            pointers:settings.sharing.pointers ? [...pointers.values()]
-              .filter(p=>p.memberId!==grant.member.id && p.surface===surface && now-p.at<POINTER_TIMEOUT && now-(lastSeen.get(p.memberId)??0)<PEER_TIMEOUT).map(({at,...p})=>p) : [],
+            pointers:visiblePointers(grant.member,now),
           });
         }
       }
@@ -399,7 +463,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
             const head=await history.head();
             if(head.rev>current.rev){
               current=head;config=shareConfig(head.tree);currentBytes=snapshotBytes(head);
-              assetToken=token();pointers.clear();actions.length=0;
+              assetToken=token();pointers.clear();actions.length=0;publishPointers();
             }
           }
           return json(receipt);
@@ -426,10 +490,13 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   localBaseUrl='http://'+localHost+':'+server.address().port;
   baseUrl=advertiseBoundPort ? localBaseUrl : advertised || localBaseUrl;
   const owner=addMember(hostName);
+  const pointerHeartbeat=setInterval(()=>{ for(const client of pointerStreams) client.send(true); },1000);
+  pointerHeartbeat.unref();
   const expiryTimer=setTimeout(()=>close(),8*60*60*1000);
   expiryTimer.unref();
   const close=()=>new Promise(resolve=>{
     clearTimeout(expiryTimer);
+    clearInterval(pointerHeartbeat);
     server.close(()=>{
       documents?.close();
       documents=undefined;
