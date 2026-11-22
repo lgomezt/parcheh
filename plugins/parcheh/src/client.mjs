@@ -381,7 +381,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     }
     const { launchHost: startHost } = await import('./room-process.mjs');
     const launch = () => startHost({
-      source: selected, continuityHome:home, continueFromRoom, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
+      source: selected, continuityHome:home, continueFromRoom, deferPublish:true, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
       releaseDirectory: env.PARCHEH_RELEASE_DIR || fileURLToPath(new URL('../dist/desktop/', import.meta.url)),
     });
     let host;
@@ -424,6 +424,13 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       state.folder = await mkdtemp(join(parent, '.parcheh-room-' + state.room + '-'));
       progress(60, 'Room created');
       const local = await install(state);
+      // The owner receipt and workspace now exist. A lost acknowledgment can
+      // be resolved from the same local transaction that selected the room.
+      try { await rpc(origin,state.room,'host-ready',state.memberToken,{}); }
+      catch (error) {
+        const {latestRoom}=await import('./project-continuity.mjs');
+        if (await latestRoom(home,selected)!==state.room) throw error;
+      }
       return { ...await readyView(state,local,openPreview,progress), sharing, inviteUrl: host.inviteUrl };
     } catch (error) {
       await host.close().catch(() => {});

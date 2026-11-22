@@ -27,7 +27,7 @@ Add this same public repository as a plugin marketplace in Codex. Install **parc
 
 Open the invitation, choose Claude Code or Codex and send the prepared request. Return to the invitation tab to see the room. For another compatible coding agent, choose Other and copy the prompt. You can share the project address directly from your browser. You can also paste the full invitation directly into a local coding chat. Your project preview opens with shared cursors and the project’s declared interactions already on. In a drawing app, both people can draw together immediately. You can include a first edit in that message, such as “Add a star sticker.”
 
-Private form fields stay local. Ask your agent to hide your cursor or turn off action sharing whenever you want.
+When the host reopens the same project folder, the next session carries forward its accepted source, change history and declared shared documents. Private form fields stay local. Ask your agent to hide your cursor or turn off action sharing whenever you want.
 
 Use your friend's invitation only in your coding chat. This public repository distributes the plugin. Your shared project and room data live on the participating computers.
 

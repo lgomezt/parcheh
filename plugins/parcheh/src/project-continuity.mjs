@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
-import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
-import { openHistory, scanTree } from './project.mjs';
+import { createHistory, forkHistory, openHistory, scanTree } from './project.mjs';
 import { isIgnoreFile, withIgnoreRules } from './project-tree.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -107,7 +107,7 @@ async function mergeOriginal(head, old, current, hashes, excluded) {
   return tree;
 }
 
-// Each new room forks a snapshot. A later write to the old room stays there.
+// Store private project history independently from each room’s credentials and drawing database.
 export async function prepareProject(home, source, priorId, onExclude) {
   if (priorId !== undefined && (typeof priorId !== 'string' || !uuid.test(priorId))) throw Error('Enter a valid previous room ID.');
   const key = await projectKey(source);
@@ -116,18 +116,23 @@ export async function prepareProject(home, source, priorId, onExclude) {
   const hashes = fingerprints(current);
   const dbPath = join(home, 'project-continuity.sqlite');
   const db = new DatabaseSync(dbPath);
-  let latest, previous;
+  let latest, previous, head, history, lineage;
   try {
     db.exec('PRAGMA busy_timeout=3000; CREATE TABLE IF NOT EXISTS projects (key TEXT PRIMARY KEY, id TEXT); CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, key TEXT, store TEXT, hashes TEXT)');
+    db.exec('CREATE TABLE IF NOT EXISTS lineages (id TEXT PRIMARY KEY, store TEXT, floor INTEGER, sealedRev INTEGER, startRev INTEGER, startOid TEXT)');
     latest = db.prepare('SELECT id FROM projects WHERE key=?').get(key)?.id;
     if (priorId || latest) previous = db.prepare('SELECT * FROM rooms WHERE id=?').get(priorId || latest);
+    if (previous) lineage = db.prepare('SELECT * FROM lineages WHERE id=?').get(previous.id);
   } finally { db.close(); }
   if (previous && previous.key !== key) throw Error('The previous room belongs to another project folder.');
   if (!previous && priorId) previous = await legacyRoom(home, priorId);
   let tree = current;
   if (previous) {
-    const history = await openHistory(join(home, previous.store));
-    const head = await history.head();
+    history = await openHistory(join(home, lineage?.store ?? previous.store));
+    if (lineage && (await history.log())[lineage.startRev-1]?.oid !== lineage.startOid) {
+      throw Error('Saved project history does not match its recorded revision. Restore its private project backup.');
+    }
+    head = await history.head(lineage?.sealedRev ?? undefined);
     let original = hashes;
     if (previous.hashes) {
       original = JSON.parse(previous.hashes);
@@ -140,7 +145,39 @@ export async function prepareProject(home, source, priorId, onExclude) {
     }
     tree = await mergeOriginal(head.tree, original, current, hashes, excluded);
   }
-  return {tree, documents: previous && join(home, previous.store + '.documents', previous.id + '.sqlite'),
+  let store, start, unpublishedStore, floor=lineage?.floor ?? 1;
+  const originalRules = Object.fromEntries(Object.entries(current).filter(([name])=>isIgnoreFile(name)));
+  return {tree, excluded, originalRules, async history(author) {
+      // The SQLite pointer publishes a complete store only after the listener and
+      // document recovery succeed. Changed source must never advance the old store.
+      const reuse = lineage && previous.id === latest && isDeepStrictEqual(head.tree,tree);
+      store = reuse ? lineage.store : 'project-' + randomUUID();
+      const target = join(home, store);
+      if (!previous) {
+        history = await createHistory(target, tree, author);
+        unpublishedStore = target;
+        start = await history.head();
+      }
+      else {
+        if (!reuse) {
+          history = await forkHistory(join(home,lineage?.store ?? previous.store),target,head);
+          unpublishedStore = target;
+        }
+        const records = (await history.log()).filter(r=>r.rev>=floor);
+        if (floor>1) records[0]={paths:Object.keys((await history.head(floor)).tree),supersededPaths:[]};
+        const paths = new Set(records.flatMap(r=>[...r.paths, ...r.supersededPaths]));
+        const visible = Object.fromEntries([...paths].map(p=>[p,true]));
+        await excludeIgnored(visible,current);
+        await excludeIgnored(visible,tree);
+        const narrowed = [...paths].some(name=> !Object.hasOwn(visible,name) ||
+          name.split('/').some((_,i,parts)=>excluded.has(parts.slice(0,i+1).join('/'))));
+        start = await history.acceptSource(head,tree,author);
+        if (narrowed) floor=start.rev;
+      }
+      return history;
+    }, async discard(){
+      if (unpublishedStore) await rm(unpublishedStore,{recursive:true,force:true});
+    }, get floor(){return floor;}, documents: previous && join(home, previous.store + '.documents', previous.id + '.sqlite'),
     publish(id, storage) {
       const db = new DatabaseSync(dbPath);
       try {
@@ -148,9 +185,12 @@ export async function prepareProject(home, source, priorId, onExclude) {
         if (db.prepare('SELECT id FROM projects WHERE key=?').get(key)?.id !== latest) {
           throw Error('Another room just opened for this project. Retry to use its accepted edits.');
         }
+        if (lineage && previous.id === latest) db.prepare('UPDATE lineages SET sealedRev=? WHERE id=?').run(head.rev,previous.id);
+        db.prepare('INSERT INTO lineages VALUES(?,?,?,NULL,?,?)').run(id,store,floor,start.rev,start.oid);
         db.prepare('INSERT INTO rooms VALUES(?,?,?,?)').run(id,key,basename(storage),JSON.stringify(hashes));
         db.prepare('INSERT OR REPLACE INTO projects VALUES(?,?)').run(key,id);
         db.exec('COMMIT');
+        unpublishedStore = undefined;
       } finally { db.close(); }
     }};
 }

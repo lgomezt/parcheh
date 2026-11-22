@@ -215,14 +215,25 @@ function history(storage) {
       return { rev: entry.rev, oid: entry.oid, tree: await readTree(storage, entry.oid) };
     },
 
+    async acceptSource(head, tree, author) {
+      const patch = treeDifference(head.tree, Object.fromEntries(checkedEntries(tree)));
+      if (!Object.keys(patch).length) return head;
+      const result = await publish(storage, head.oid, patch, {
+        format: FORMAT, rev: head.rev + 1, actor: identity(author, 'author'), baseRev: head.rev,
+        paths: Object.keys(patch), supersededPaths: [],
+      });
+      if (!result) throw fault('HISTORY_WRITE', 'Project history changed during startup.');
+      return {...head, rev:result.rev, oid:result.oid, tree};
+    },
+
     async log() {
       return (await records(storage)).map(({ format, digest, ...entry }) => entry);
     },
 
-    async submit({ id, baseRev, changes, author }) {
+    async submit({ id, baseRev, changes, author }, {scopeRev=1, minimumRev=1, excluded=new Set(), originalRules}={}) {
       id = identity(id, 'submission ID');
       author = identity(author, 'author');
-      if (!Number.isSafeInteger(baseRev) || baseRev < 1) {
+      if (!Number.isSafeInteger(baseRev) || baseRev < minimumRev) {
         throw fault('UNKNOWN_BASE', 'The base revision does not exist.');
       }
       const patch = checkedEntries(changes, { changes: true });
@@ -234,7 +245,7 @@ function history(storage) {
           const revisions = await records(storage);
           const previous = revisions.find((entry) => entry.id === id);
           if (previous) {
-            if (previous.digest !== digest) throw fault('ID_REUSE', 'This submission ID already belongs to a different change.');
+            if (previous.rev < minimumRev || previous.digest !== digest) throw fault('ID_REUSE', 'This submission ID already belongs to a different change.');
             return receipt(previous);
           }
           const base = revisions[baseRev - 1];
@@ -242,7 +253,10 @@ function history(storage) {
           const head = revisions.at(-1);
           const baseTree = await readTree(storage, base.oid);
           checkCandidate(baseTree, patch);
-          await checkIgnoredPaths(baseRev === 1 ? baseTree : await readTree(storage, revisions[0].oid), patch);
+          if (patch.some(([name]) => name.split('/').some((_, i, parts) =>
+            excluded.has(parts.slice(0, i + 1).join('/'))))) throw fault('FORBIDDEN_PATH', 'Excluded project path.');
+          if (originalRules) await checkIgnoredPaths(originalRules, patch);
+          await checkIgnoredPaths(baseRev === scopeRev ? baseTree : await readTree(storage, revisions[scopeRev-1].oid), patch);
           const headTree = base.oid === head.oid ? baseTree : await readTree(storage, head.oid);
           const { tree, supersededPaths } = overlay(baseTree, headTree, patch);
           const result = await publish(storage, head.oid, treeDifference(headTree, tree), {
@@ -295,4 +309,19 @@ export async function createHistory(storage, tree, author) {
       throw error;
     }
   });
+}
+
+// Import the selected immutable commit and its ancestors into independent storage.
+export async function forkHistory(source, target, head) {
+  await fs.mkdir(target, {mode:0o700});
+  try {
+    await git(target, ['init', '--bare', '--quiet', '--template=', '--initial-branch=room', '--object-format=sha1']);
+    await atStore(target, ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', source, head.oid + ':' + HEAD]);
+    const result = await openHistory(target);
+    if ((await result.log()).at(-1)?.oid !== head.oid) throw fault('INVALID_HISTORY', 'Imported project head differs.');
+    return result;
+  } catch (error) {
+    await fs.rm(target, {recursive:true, force:true});
+    throw error;
+  }
 }

@@ -154,11 +154,17 @@ const shellPolicy="default-src 'none'; script-src 'self'; style-src 'self' 'unsa
 
 export async function startHost(options) {
   const lock = options.continuityHome && await lockProject(options.continuityHome,options.source);
-  try { return await serveHost(options,lock); }
-  catch (error) { lock?.close(); throw error; }
+  let continuation;
+  try {
+    if (lock) continuation=await prepareProject(options.continuityHome,options.source,options.continueFromRoom);
+    return await serveHost(options,lock,continuation);
+  } catch (error) {
+    try { await continuation?.discard(); } finally { lock?.close(); }
+    throw error;
+  }
 }
 
-async function serveHost({source, storage, continuityHome, continueFromRoom, displayName, bind='127.0.0.1',port=0,publicOrigin,releaseDirectory=process.env.PARCHEH_RELEASE_DIR},lock) {
+async function serveHost({source, storage, displayName, deferPublish=false, bind='127.0.0.1',port=0,publicOrigin,releaseDirectory=process.env.PARCHEH_RELEASE_DIR},lock,continuation) {
   if (bind==='[::1]') bind='::1';
   const advertised=publicAddress(bind,publicOrigin);
   const advertiseBoundPort=advertised && new URL(advertised).port==='0';
@@ -168,11 +174,12 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
   }
   if (!Number.isInteger(Number(port))||Number(port)<0||Number(port)>65535) throw Error('Invalid listening port.');
   const hostName=nameOf(displayName);
-  const continuation=continuityHome && await prepareProject(continuityHome,source,continueFromRoom);
   const tree=continuation?.tree ?? await scanTree(source);
   await mkdir(dirname(storage),{recursive:true,mode:0o700});
-  const history=await createHistory(storage,tree,hostName);
+  const history=continuation ? await continuation.history(hostName) : await createHistory(storage,tree,hostName);
   let current=await history.head(), config=shareConfig(current.tree), currentBytes=snapshotBytes(current);
+  const scopeRev=current.rev, floor=continuation?.floor ?? 1;
+  const scopeBaseline=floor>1 ? await history.head(floor) : null;
   let activeBulk=0, activeBytes=0;
   function reserveBulk(bytes, counted=true) {
     if (bytes>MAX_BULK_BYTES) throw fail(413,'Room transfer exceeds the size limit.');
@@ -204,13 +211,24 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
   const roomId = randomUUID();
   const inviteLifetime = 8 * 60 * 60 * 1000;
   let inviteSecret = token(), expires = Date.now() + inviteLifetime;
-  let documents;
+  function documentScope(config) {
+    const doc=config?.document;
+    return doc ? JSON.stringify([doc.id,...[...doc.actions].sort().map(id=>[id,config.payloads[id]])]) : '';
+  }
+  let documents, scope=documentScope(config), projectedScope=scope;
+  function refreshDocuments() {
+    if (!documents) return;
+    if (scope===projectedScope) return;
+    documents.project(config?.document,(action,payload)=>validatedPayload(config,action,payload));
+    projectedScope=scope;
+  }
   function documentStore() {
     if (!documents) {
       const directory=resolve(storage)+'.documents';
       mkdirSync(directory,{recursive:true,mode:0o700});
       documents=openDocumentStore(join(directory,roomId+'.sqlite'));
     }
+    refreshDocuments();
     return documents;
   }
   let assetToken=token();
@@ -321,6 +339,14 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
     return {sharing};
   }
 
+  let published=false, closing=false, setupTimer;
+  function activate() {
+    if (closing) throw fail(409,'Room setup has ended.');
+    if (published) return;
+    continuation?.publish(roomId,storage);
+    published=true;
+    clearTimeout(setupTimer);
+  }
   const server=http.createServer({
     headersTimeout:10_000,
     requestTimeout:TRANSFER_TIMEOUT,
@@ -392,6 +418,9 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
       const prefix='/api/rooms/'+roomId+'/';
       if (!path.startsWith(prefix)) throw fail(404,'Unknown room or endpoint.');
       const route=path.slice(prefix.length);
+      if (!published && !['status','scope','snapshot','sharing','close','host-ready'].includes(route)) {
+        throw fail(503,'The host workspace is still opening.');
+      }
       if (['tab-register','tab-receive','tab-ack'].includes(route) && req.method === 'POST') {
         const msg = await jsonBody(req);
         fields(msg, ['id','receipt'],route === 'tab-register' ? [] : ['claim']);
@@ -477,7 +506,12 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
           return json(current);
         }
         if(route==='scope') return json({tree:scopeRules});
-        if(route==='history') return json({entries:await history.log()});
+        if(route==='history') {
+          const entries=(await history.log()).filter(r=>r.rev>=floor);
+          if (scopeBaseline) entries[0]={rev:floor,oid:scopeBaseline.oid,actor:entries[0].actor,
+            paths:Object.keys(scopeBaseline.tree),supersededPaths:[]};
+          return json({entries});
+        }
         const settings=sharingByMember.get(grant.member.id);
         if(route==='invite') return json({inviteUrl:inviteUrl()});
         if(route==='document') {
@@ -507,6 +541,12 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
             pointers:visiblePointers(grant.member,now),
           });
         }
+      }
+      if (req.method==='POST' && route==='host-ready') {
+        if (grant.member!==members[0]) throw fail(403,'Only the host can finish room setup.');
+        fields(await jsonBody(req),[]);
+        activate();
+        return json({ready:true});
       }
       if (req.method === 'POST' && route === 'host-invite') {
         if (grant.member !== members[0]) throw fail(403,'Only the host can renew an invitation.');
@@ -553,12 +593,14 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
           const msg=await jsonBody(req,MAX_SUBMIT_BYTES); fields(msg,['id','baseRev','changes']);
           if(typeof msg.id!=='string'||msg.id.length>100||!msg.id||!Number.isSafeInteger(msg.baseRev)||msg.baseRev<1) throw fail(400,'Invalid submission.');
           let receipt;
-          try { receipt=await history.submit({...msg,author:grant.member.name}); }
+          try { receipt=await history.submit({...msg,author:grant.member.name},{scopeRev, minimumRev:floor, excluded:continuation?.excluded, originalRules:continuation?.originalRules}); }
           catch { throw fail(409,'Submission rejected. Check the base, changed paths, and submission ID.'); }
           if(receipt.rev>current.rev){
             const head=await history.head();
             if(head.rev>current.rev){
               current=head;config=shareConfig(head.tree);currentBytes=snapshotBytes(head);
+              scope=documentScope(config);
+              refreshDocuments();
               assetToken=token();pointers.clear();actions.length=0;publishPointers();
             }
           }
@@ -586,12 +628,12 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
   localBaseUrl='http://'+localHost+':'+server.address().port;
   baseUrl=advertiseBoundPort ? localBaseUrl : advertised || localBaseUrl;
   try {
-    if (config?.document && continuation?.documents) {
+    if (continuation?.documents) {
       const file = await lstat(continuation.documents).catch(e => { if (e.code !== 'ENOENT') throw e; });
-      if (file?.isFile()) documentStore().inherit(continuation.documents, config.document,
+      if (file?.isFile()) documentStore().inherit(continuation.documents, config?.document,
         (action,payload)=>validatedPayload(config,action,payload));
     }
-    continuation?.publish(roomId,storage);
+    if (!deferPublish) activate();
   } catch (error) {
     documents?.close();
     await new Promise(done=>server.close(done));
@@ -603,15 +645,20 @@ async function serveHost({source, storage, continuityHome, continueFromRoom, dis
   const expiryTimer=setTimeout(()=>close(),8*60*60*1000);
   expiryTimer.unref();
   const close=()=>new Promise(resolve=>{
+    closing=true;
+    clearTimeout(setupTimer);
     clearTimeout(expiryTimer);
     clearInterval(pointerHeartbeat);
-    server.close(()=>{
+    server.close(async()=>{
       documents?.close();
       documents=undefined;
-      if (lock?.isOpen) lock.close();
-      resolve();
+      try { if (!published) await continuation?.discard(); } finally {
+        if (lock?.isOpen) lock.close();
+        resolve();
+      }
     });
     server.closeAllConnections();
   });
+  if (!published) setupTimer=setTimeout(close,120000).unref();
   return {...owner,baseUrl,localBaseUrl,inviteUrl:inviteUrl(),close};
 }

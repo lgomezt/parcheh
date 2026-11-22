@@ -16,27 +16,58 @@ export function openDocumentStore(path) {
       UNIQUE(documentId, seq), UNIQUE(documentId, memberId, id)
     );
   `);
+  // The private journal follows the chosen room lineage. The operations table
+  // is the contiguous projection available to guests of this room.
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='journal'").get()) {
+    db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE journal AS SELECT documentId,id,memberId,name,actionId,payload FROM operations ORDER BY rowid;
+      COMMIT;`);
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS journal_ids ON journal(documentId,memberId,id)');
+  const known = db.prepare('SELECT 1 FROM journal WHERE documentId=? AND memberId=? AND id=?');
+  const remember = db.prepare('INSERT INTO journal (documentId,id,memberId,name,actionId,payload) VALUES (?,?,?,?,?,?)');
   const latest = db.prepare('SELECT MAX(seq) AS seq FROM operations WHERE documentId = ?');
   const head = (documentId) => latest.get(documentId).seq ?? 0;
   const lookup = db.prepare('SELECT seq, actionId, payload FROM operations WHERE documentId=? AND memberId=? AND id=?');
-  const size = db.prepare('SELECT MAX(rowid) AS count FROM operations');
+  const size = db.prepare('SELECT MAX(rowid) AS count FROM journal');
   const insert = db.prepare('INSERT INTO operations (documentId,seq,id,memberId,name,actionId,payload) VALUES (?,?,?,?,?,?,?)');
   const page = db.prepare('SELECT seq,id,memberId,name,actionId,payload FROM operations WHERE documentId=? AND seq>? ORDER BY seq LIMIT ?');
 
+  function rebuild(document, validate) {
+    db.exec('DELETE FROM operations');
+    if (!document) return;
+    let seq=0;
+    for (const row of db.prepare('SELECT * FROM journal WHERE documentId=? ORDER BY rowid').iterate(document.id)) {
+      if (!document.actions.includes(row.actionId)) continue;
+      let payload;
+      try { payload=validate(row.actionId,JSON.parse(row.payload)); } catch { continue; }
+      insert.run(document.id,++seq,row.id,row.memberId,row.name,row.actionId,JSON.stringify(payload));
+    }
+  }
+
   return {
     head,
+    project(document, validate) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        rebuild(document,validate);
+        db.exec('COMMIT');
+      } finally {
+        if (db.isTransaction) db.exec('ROLLBACK');
+      }
+    },
     inherit(source, document, validate) {
       const previous = new DatabaseSync(source, {readOnly:true});
       try {
         db.exec('BEGIN IMMEDIATE');
-        let seq=0;
-        for (const row of previous.prepare('SELECT * FROM operations WHERE documentId=? ORDER BY seq').iterate(document.id)) {
-          if (!document.actions.includes(row.actionId)) continue;
-          let payload;
-          try { payload=validate(row.actionId,JSON.parse(row.payload)); } catch { continue; }
-          if (++seq > MAX_OPERATIONS) throw fail(507,'The room drawing history is full.');
-          insert.run(document.id,seq,row.id,row.memberId,row.name,row.actionId,JSON.stringify(payload));
+        const hasJournal = previous.prepare("SELECT 1 FROM sqlite_master WHERE name='journal'").get();
+        const rows = previous.prepare(hasJournal ? 'SELECT * FROM journal ORDER BY rowid' : 'SELECT * FROM operations ORDER BY rowid');
+        let count=0;
+        for (const row of rows.iterate()) {
+          if (++count > MAX_OPERATIONS) throw fail(507,'The room drawing history is full.');
+          remember.run(row.documentId,row.id,row.memberId,row.name,row.actionId,row.payload);
         }
+        rebuild(document,validate);
         db.exec('COMMIT');
       } finally {
         if (db.isTransaction) db.exec('ROLLBACK');
@@ -54,9 +85,11 @@ export function openDocumentStore(path) {
             throw fail(409, 'This operation ID already belongs to another change.');
           }
         } else {
+          if (known.get(documentId,member.id,id)) throw fail(409,'This operation ID already belongs to another change.');
           if (size.get().count >= MAX_OPERATIONS) throw fail(507, 'The room drawing history is full.');
           seq = head(documentId) + 1;
           insert.run(documentId, seq, id, member.id, member.name, actionId, encoded);
+          remember.run(documentId,id,member.id,member.name,actionId,encoded);
         }
         db.exec('COMMIT');
         return { documentId, seq, id };
