@@ -6,26 +6,7 @@
 
 Start with a new project or one you already have. Share one link, ask your own agents to make changes, and see each other’s edits and cursors in the same project preview.
 
-Install parcheh in Codex or Claude Code, or try the experimental Antigravity integration. Other coding tools can join with a compatible MCP setup.
-
-## Install in Claude Code
-
-Use the **Code** tab in Claude Desktop on an Apple silicon Mac. For this pilot, work on the same Wi-Fi as the host.
-
-1. In Claude Desktop, open **Plugins** and choose **Add marketplace** or **Add from repository**. In a local Code session, the **+** menu also opens the plugin manager.
-2. Paste the publisher's address shown below. Choose **parcheh** and click **Install**. If Claude asks to reload plugins, accept.
-
-```text
-https://github.com/lgomezt/parcheh.git
-```
-
-3. In the settings for this marketplace, turn on **auto-update** to receive new releases.
-
-You can install without signing in to GitHub. This release includes Node. parcheh uses your Mac's Git to sync project files. If Git is missing, macOS may ask to install its developer tools.
-
-## Install in Codex
-
-Add this same public repository as a plugin marketplace in Codex. Install **parcheh** from **parcheh pilot** and approve the requested access. The Mac package includes its own runtime.
+[Install parcheh](#installation) in Codex, Claude Code, Antigravity, or another coding tool that supports local MCP servers.
 
 ## Join and make your first edit
 
@@ -35,4 +16,33 @@ When the host reopens the same project folder, the next session carries forward 
 
 Use your friend's invitation only in your coding chat. This public repository distributes the plugin. Your shared project and room data live on the participating computers.
 
-[Claude Desktop plugin guide](https://code.claude.com/docs/en/desktop#install-plugins)
+## Installation
+
+These instructions are for Apple silicon Macs. For the current pilot, connect to the same Wi-Fi as the host.
+
+### Codex and Claude Code
+
+Use this repository address for both apps.
+
+```text
+https://github.com/lgomezt/parcheh.git
+```
+
+- **Codex.** In **Plugins**, add the repository as a marketplace. Install **parcheh** from **parcheh pilot** and approve the requested access.
+- **Claude Code.** In the **Code** tab of Claude Desktop, open **Plugins** and choose **Add marketplace** or **Add from repository**. Install **parcheh** and reload if prompted. Enable **auto-update** in the marketplace settings to receive new releases. [Claude Desktop plugin guide](https://code.claude.com/docs/en/desktop#install-plugins)
+
+The plugin bundles Node.js and uses your Mac’s Git. macOS may ask you to install its command-line developer tools.
+
+### Antigravity
+
+Ask your host for the experimental Antigravity kit and unzip it. In Antigravity’s MCP settings, add the `parcheh` entry from the kit’s `mcp_config.json`. Replace `${PLUGIN_ROOT}` with the full path to the extracted `parcheh` folder. Then open the invitation and choose **Antigravity**. [Antigravity MCP settings](https://antigravity.google/docs/mcp/)
+
+### Other coding tools
+
+Use a local coding tool that supports MCP servers over standard input and output (`stdio`) and can edit files in a local workspace. [Download this repository as a ZIP](https://github.com/lgomezt/parcheh/archive/refs/heads/main.zip), unzip it, and register `parcheh` in your app’s MCP settings using the command and arguments below.
+
+- **Command** `/bin/sh`
+- **Argument** The full path to `plugins/parcheh/launch-mcp.sh` in the extracted folder
+- **Environment variables** `PARCHEH_DESKTOP=1` and `PARCHEH_ALLOW_LAN_HTTP=1`
+
+Open the invitation, choose **Other**, and paste the prepared prompt into your coding chat.
