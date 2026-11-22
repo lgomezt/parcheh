@@ -1,0 +1,15 @@
+{
+  "name": "parcheh-pilot",
+  "owner": {
+    "name": "Parcheh"
+  },
+  "metadata": {
+    "description": "Start, join and edit a shared Parcheh project."
+  },
+  "plugins": [
+    {
+      "name": "parcheh",
+      "source": "./plugins/parcheh"
+    }
+  ]
+}

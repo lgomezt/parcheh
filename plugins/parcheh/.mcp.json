@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "parcheh": {
+      "type": "stdio",
+      "command": "/bin/sh",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/launch-mcp.sh"
+      ],
+      "env": {
+        "PARCHEH_DESKTOP": "1",
+        "PARCHEH_ALLOW_LAN_HTTP": "1"
+      }
+    }
+  }
+}

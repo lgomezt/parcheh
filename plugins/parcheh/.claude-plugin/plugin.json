@@ -1,0 +1,8 @@
+{
+  "name": "parcheh",
+  "version": "0.2.0",
+  "description": "Start, join and edit a shared Parcheh project.",
+  "author": {
+    "name": "Parcheh"
+  }
+}
