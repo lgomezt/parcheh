@@ -193,7 +193,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
     const member={id:randomUUID(),name};
     const memberToken=token(), browserToken=token();
     members.push(member); grants.set(memberToken,{member,role:'editor'});
-    sharingByMember.set(member.id,{sharing:{pointers:false,actions:false},sharingEpoch:0,sharingActionSeq:sequence});
+    sharingByMember.set(member.id,{sharing:{pointers:true,actions:true},sharingEpoch:0,sharingActionSeq:sequence});
     grants.set(browserToken,{member,role:'browser'});
     return {roomId,memberToken,browserUrl:baseUrl+'/view/'+roomId+'#'+browserToken};
   }

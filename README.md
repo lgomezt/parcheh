@@ -21,7 +21,9 @@ You can install without signing in to GitHub. This release includes Node. parche
 
 ## Join and make your first edit
 
-In a local Code chat, paste the full room invitation from your friend and say what you'd like to change. For example, “Join this room, share my pointer, and add a star sticker.” The personal preview opens in your browser.
+In a local Code chat, paste the full invitation and say “Join this room.” Your project preview opens with shared cursors and the project’s declared interactions already on. In a drawing app, both people can draw together immediately. You can include a first edit in that message, such as “Add a star sticker.”
+
+Private form fields stay local. Ask your agent to hide your cursor or turn off action sharing whenever you want.
 
 Use your friend's invitation only in your coding chat. This public repository distributes the plugin. Your shared project and room data live on the participating computers.
 

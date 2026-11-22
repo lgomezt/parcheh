@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
 import { homedir, networkInterfaces } from 'node:os';
@@ -311,11 +311,25 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return {fileCount:names.length, bytes:Object.values(files).reduce((n,f)=>n+Buffer.byteLength(f.data,'base64'),0), paths:names, excluded};
   }
 
-  async function readyView(state, local, {pointers,actions,openPreview}, progress) {
-    if (pointers !== undefined || actions !== undefined) {
-      const result = await configure_browser({room:state.room,pointers,actions});
-      local.sharing = result.sharing;
+  async function browserSettings(state, { pointers, actions }, fresh = false) {
+    const status = await rpc(state.origin, state.room, 'status', state.memberToken);
+    const { sharing } = status;
+    if (!sharing || typeof sharing.pointers !== 'boolean' || typeof sharing.actions !== 'boolean') {
+      // The earliest hosts support code collaboration without configurable browser sharing.
+      if (pointers === undefined && actions === undefined) return status;
+      throw new Error('This host does not support browser sharing settings.');
     }
+    const desired = {
+      pointers: pointers ?? (fresh || sharing.pointers),
+      actions: actions ?? (fresh || sharing.actions),
+    };
+    if (desired.pointers !== sharing.pointers || desired.actions !== sharing.actions) {
+      status.sharing = (await rpc(state.origin, state.room, 'sharing', state.memberToken, desired)).sharing;
+    }
+    return status;
+  }
+
+  async function readyView(state, local, openPreview, progress) {
     if (desktop && process.platform === 'darwin' && env.PARCHEH_OPEN_BROWSER !== '0' && openPreview !== false &&
         local.browserUrl && (!state.openedPreview || openPreview === true)) {
       try {
@@ -355,10 +369,11 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       parseInvite(host.inviteUrl, allowLanHttp);
       const origin = reachableUrl(host.localBaseUrl ?? host.baseUrl, allowLanHttp).origin;
       const state = { ...binding(host.roomId, origin, host, allowLanHttp, host.baseUrl), host: true };
+      const { sharing } = await browserSettings(state, { pointers, actions }, true);
       state.folder = await mkdtemp(join(parent, '.parcheh-room-' + state.room + '-'));
       progress(60, 'Room created');
       const local = await install(state);
-      return { ...await readyView(state,local,{pointers,actions,openPreview},progress), inviteUrl: host.inviteUrl };
+      return { ...await readyView(state,local,openPreview,progress), sharing, inviteUrl: host.inviteUrl };
     } catch (error) {
       await host.close().catch(() => {});
       throw error;
@@ -376,37 +391,46 @@ export async function openClient(env = process.env, { getRoots = async () => [],
         throw new Error('That room is already bound to a different host or workspace on this device.');
       }
       const result = !state.turn ? await install(state) : { ...workspaceInfo(state), ...browserView(state) };
-      return readyView(state,result,{pointers,actions,openPreview},progress);
+      // Reopening an existing draft without changing its settings also works offline.
+      if (!state.turn || pointers !== undefined || actions !== undefined) {
+        result.sharing = (await browserSettings(state, { pointers, actions })).sharing;
+      }
+      return readyView(state,result,openPreview,progress);
     }
     const pendingPath = join(home, 'join-' + room + '.json');
     const fingerprint = createHash('sha256').update(inviteUrl).digest('hex');
     let pending = await readJson(pendingPath);
     if (!pending || pending.fingerprint !== fingerprint) {
       pending = { fingerprint, displayName, requestId:randomUUID() };
-      await writeJson(pendingPath, pending);
     }
-    const folder = await mkdtemp(join(parent, '.parcheh-room-' + room + '-'));
+    pending.sharing ??= {};
+    if (pointers !== undefined) pending.sharing.pointers = pointers;
+    if (actions !== undefined) pending.sharing.actions = actions;
+    await writeJson(pendingPath, pending);
     async function admit() {
       // v1 hosts do not understand requestId. Only retry an ambiguous delivery on v2.
       const request = { inviteSecret, displayName:pending.displayName, requestId:pending.requestId };
       try { return await rpc(origin, room, 'join', undefined, request); }
       catch (error) {
-        if (error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName });
+        if (error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName:pending.displayName });
         if (error.message.startsWith('Could not reach')) return rpc(origin, room, 'join', undefined, request);
         throw error;
       }
     }
     const member = await admit().catch(async (error) => {
-      await rmdir(folder).catch(() => {});
       if (error.message.includes('(HTTP 4')) await rm(pendingPath,{force:true});
       throw error;
     });
-    const state = { ...binding(room, origin, member, allowLanHttp), folder };
+    const state = binding(room, origin, member, allowLanHttp);
+    // Set fresh enrollment defaults before saving or exposing the browser URL. The
+    // outstanding join receipt lets a retry recover this member on a 0.2.x host.
+    const { sharing } = await browserSettings(state, pending.sharing, true);
+    state.folder = await mkdtemp(join(parent, '.parcheh-room-' + room + '-'));
     await save(state);
     await rm(pendingPath, {force:true});
     progress(55, 'Joined');
     const result = await install(state);
-    return readyView(state,result,{pointers,actions,openPreview},progress);
+    return readyView(state,{ ...result, sharing },openPreview,progress);
   }
 
   const editingTimers = new Map();
@@ -546,23 +570,13 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     if (local && new URL(local).origin === new URL(state.browserUrl).origin) {
       throw new Error('Use a development server on a different origin from the room.');
     }
-    const status = await rpc(state.origin, room, 'status', state.memberToken);
-    let sharing = status.sharing;
-    if (!sharing || typeof sharing.pointers !== 'boolean' || typeof sharing.actions !== 'boolean') {
-      throw new Error('This room uses an older host. Start a room with the current prototype to configure browser sharing.');
-    }
-    if (pointers !== undefined || actions !== undefined) {
-      const result = await rpc(state.origin, room, 'sharing', state.memberToken, {
-        pointers: pointers ?? sharing.pointers,
-        actions: actions ?? sharing.actions,
-      });
-      sharing = result.sharing;
-    }
+    const { sharing, previewAvailable } = await browserSettings(state, { pointers, actions });
+    if (!sharing) throw new Error('This host does not support browser sharing settings.');
     if (appUrl !== undefined) {
       state.localAppUrl = local;
       await save(state);
     }
-    return { room, sharing, ...browserView(state, status.previewAvailable) };
+    return { room, sharing, ...browserView(state, previewAvailable) };
   }
 
   async function room_history({ room }) {

@@ -261,7 +261,10 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
     if (control) publish(control.getAttribute('data-parcheh-action'));
   }, { capture: true, signal });
   document.addEventListener('parcheh:publish', (event) => {
-    if (event.target === activeStage()) publish(event.detail?.actionId, event.detail?.payload, event);
+    const stage = activeStage();
+    if (event.target === stage && !stage.closest(privateControls)) {
+      publish(event.detail?.actionId, event.detail?.payload, event);
+    }
   }, { capture: true, signal });
 
   document.addEventListener('parcheh:save-private', (event) => {

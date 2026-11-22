@@ -8,8 +8,8 @@ const path = { type: 'string', minLength: 1 };
 const name = { type: 'string', minLength: 1 };
 const room = { type: 'string', format: 'uuid' };
 const browserOptions = {
-  pointers:{type:'boolean',description:'Enable only when the user asks to share their cursor.'},
-  actions:{type:'boolean',description:'Enable only when the user asks to share project actions or drawings.'},
+  pointers:{type:'boolean',description:'The room shares the project cursor on entry. Set false to keep it private.'},
+  actions:{type:'boolean',description:'The room shares project-declared actions and drawings on entry. Set false to keep them private.'},
   openPreview:{type:'boolean',description:'Open the personal project view in the desktop browser. Defaults to first entry.'},
 };
 const tools = [
@@ -51,7 +51,7 @@ const tools = [
   },
   {
     name: 'configure_browser',
-    description: 'Set this participant’s pointer or named action sharing when they request it. Both are off by default. Optionally select their local dev server or use appUrl="project" to return to the accepted static project.',
+    description: 'Enable or disable this participant’s cursor and project-declared actions independently. Both start enabled when someone enters a room. Optionally select their local dev server or use appUrl="project" to return to the accepted static project.',
     properties: { room, pointers: { type: 'boolean' }, actions: { type: 'boolean' }, appUrl: path },
     required: ['room'],
   },
