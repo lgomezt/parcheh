@@ -2,6 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { openClient } from './client.mjs';
+import packageInfo from '../package.json' with { type: 'json' };
 
 const path = { type: 'string', minLength: 1 };
 const name = { type: 'string', minLength: 1 };
@@ -137,7 +138,7 @@ async function handle(message) {
       return success(id, {
         protocolVersion: protocolVersions.includes(params.protocolVersion) ? params.protocolVersion : protocolVersions[0],
         capabilities: { tools: {} },
-        serverInfo: { name: 'parcheh', version: '0.2.0' },
+        serverInfo: { name: 'parcheh', version: packageInfo.version },
       });
     case 'ping':
       return success(id, {});
