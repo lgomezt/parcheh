@@ -2,9 +2,11 @@
 
 ![parcheh logo with blue and coral paper cutouts](https://raw.githubusercontent.com/lgomezt/parcheh/d73a0aa182c4294cd42d8754ad3ccbf15bef78f6/assets/readme-banner.png)
 
-Build a project together from the coding agents you already use. Share one room link, ask each agent for changes in its own chat, and see the edits and each other’s cursors in the project preview.
+**Vibe code together, each with your own coding agent.**
 
-parcheh handles collaboration through the Model Context Protocol (MCP). Each coding tool can have its own integration with the same room.
+Start with a new project or one you already have. Share one link, ask your own agents to make changes, and see each other’s edits and cursors in the same project preview.
+
+Install parcheh in Codex or Claude Code, or try the experimental Antigravity integration. Other coding tools can join with a compatible MCP setup.
 
 ## Install in Claude Code
 
