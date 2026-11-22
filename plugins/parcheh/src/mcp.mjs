@@ -19,13 +19,13 @@ const tools = [
   {
     name: 'preview_scope',
     description: 'Inspect a selected project locally before starting a room. Returns eligible paths and exclusion counts without transferring files.',
-    properties: { source: path },
+    properties: { continueFromRoom: {type:"string", description:"Explicitly fork a previous room hosted here. Use for older saved rooms with a verified local host history or to select an earlier branch."}, source: path },
     required: process.env.PARCHEH_DESKTOP === '1' ? [] : ['source'],
   },
   {
     name: 'start_room',
     description: 'Share a selected project directory in a new parcheh room. Returns the invitation, browser link and local accepted workspace.',
-    properties: { source: path, workspaceParent: path, displayName: name, ...browserOptions },
+    properties: { continueFromRoom: {type:"string", description:"Explicitly fork a previous room hosted here. Use for older saved rooms with a verified local host history or to select an earlier branch."}, source: path, workspaceParent: path, displayName: name, ...browserOptions },
     required: process.env.PARCHEH_DESKTOP === '1' ? [] : ['source'],
   },
   {

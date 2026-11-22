@@ -70,11 +70,13 @@ function reachableUrl(input, allowLanHttp) {
 function parseInvite(input, allowLanHttp) {
   const url = reachableUrl(input, allowLanHttp);
   const [, prefix, room] = url.pathname.split('/');
-  const secret = url.hash.slice(1);
+  const [secret, suffix, ...extra] = url.hash.slice(1).split('&');
+  const handoff = suffix?.match(/^handoff=([0-9a-f]{48})$/)?.[1];
+  if (extra.length || (suffix !== undefined && !handoff)) throw Error('Invalid invitation tab handoff.');
   if (prefix !== 'r' || !uuid.test(room) || url.pathname !== '/r/' + room || url.search || !token.test(secret)) {
     throw new Error('The parcheh invitation must include its room ID and secret fragment.');
   }
-  return { room, origin: url.origin, inviteSecret: secret };
+  return { room, origin: url.origin, inviteSecret: secret, handoff };
 }
 
 async function rpc(origin, room, endpoint, memberToken, body) {
@@ -315,14 +317,14 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return { ...workspaceInfo(state), ...browserView(state) };
   }
 
-  async function preview_scope({ source }) {
+  async function preview_scope({ source, continueFromRoom }) {
     const selected = await chooseSource(source);
     if (inside(selected, home) || inside(home, selected)) throw new Error('The source must exclude PARCHEH_HOME.');
-    const {scanTree} = await import('./project.mjs');
+    const {prepareProject} = await import('./project-continuity.mjs');
     const excluded = {};
-    const files = await scanTree(selected, { onExclude(_path, reason) {
+    const {tree: files} = await prepareProject(home, selected, continueFromRoom, (_path, reason) => {
       excluded[reason] = (excluded[reason] || 0) + 1;
-    }});
+    });
     const names = Object.keys(files).sort();
     return {fileCount:names.length, bytes:Object.values(files).reduce((n,f)=>n+Buffer.byteLength(f.data,'base64'),0), paths:names, excluded};
   }
@@ -358,7 +360,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return local;
   }
 
-  async function start_room({ source, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
+  async function start_room({ source, continueFromRoom, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
     const name = entryDisplayName(displayName);
     const selected = await chooseSource(source);
     if (inside(selected, home) || inside(home, selected)) throw new Error('The source must exclude PARCHEH_HOME.');
@@ -378,10 +380,42 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       throw new Error('Set PARCHEH_PUBLIC_ORIGIN to the address that guests can reach.');
     }
     const { launchHost: startHost } = await import('./room-process.mjs');
-    const host = await startHost({
-      source: selected, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
+    const launch = () => startHost({
+      source: selected, continuityHome:home, continueFromRoom, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
       releaseDirectory: env.PARCHEH_RELEASE_DIR || fileURLToPath(new URL('../dist/desktop/', import.meta.url)),
     });
+    let host;
+    try { host = await launch(); } catch (error) {
+      if (error.code !== 'PROJECT_ACTIVE') throw error;
+      const {latestRoom} = await import('./project-continuity.mjs');
+      // A simultaneous first start may still be installing the owner's workspace.
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const id = await latestRoom(home,selected);
+        const state = id && await readJson(statePath(id));
+        if (state?.host && state.closed) {
+          // A close receipt may arrive just before the previous process releases the folder.
+          try { host = await launch(); break; }
+          catch (retry) { if (retry.code !== 'PROJECT_ACTIVE') throw retry; }
+        }
+        if (state?.host && !state.closed && state.accepted) {
+          if (continueFromRoom && continueFromRoom !== id) throw error;
+          const result = await api.room_status({room:id});
+          if (!result.connected) throw Error('The project host still owns this room but could not be reached. Retry when the host responds.');
+          const invite = await rpc(state.origin,id,'host-invite',state.memberToken,{});
+          const parsed = parseInvite(invite.inviteUrl,allowLanHttp);
+          if (parsed.room !== id || parsed.origin !== new URL(state.browserUrl).origin) throw Error('The running room returned an invalid invitation.');
+          if (pointers !== undefined || actions !== undefined) {
+            result.sharing = (await api.configure_browser({room:id,pointers,actions})).sharing;
+          }
+          if (openPreview === true && desktop && result.browserUrl) await openPreviewUrl(result.browserUrl);
+          progress(100,'Ready');
+          return {...result, inviteUrl:invite.inviteUrl};
+        }
+        await new Promise(done=>setTimeout(done,100));
+      }
+      if (!host) throw error;
+    }
     try {
       parseInvite(host.inviteUrl, allowLanHttp);
       const origin = reachableUrl(host.localBaseUrl ?? host.baseUrl, allowLanHttp).origin;
@@ -399,7 +433,14 @@ export async function openClient(env = process.env, { getRoots = async () => [],
 
   async function join_room({ inviteUrl, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
     const name = entryDisplayName(displayName);
-    const { room, origin, inviteSecret } = parseInvite(inviteUrl, allowLanHttp);
+    const { room, origin, inviteSecret, handoff } = parseInvite(inviteUrl, allowLanHttp);
+    async function finishJoin(state, result) {
+      if (!handoff) return readyView(state,result,openPreview,progress);
+      const app = state.localAppUrl ? localAppAddress(state.localAppUrl) : null;
+      await rpc(origin,room,'tab-confirm',state.memberToken,{id:handoff,inviteSecret,...(app && {app})});
+      progress(100,'Ready in the invitation tab');
+      return {...result, browserUrl:null, browserHandoff:'invitation-tab'};
+    }
     const parent = await chooseWorkspace(workspaceParent);
     progress(15, 'Invite checked');
     const existing = await readJson(statePath(room));
@@ -413,10 +454,10 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       if (!state.turn || pointers !== undefined || actions !== undefined) {
         result.sharing = (await browserSettings(state, { pointers, actions })).sharing;
       }
-      return readyView(state,result,openPreview,progress);
+      return finishJoin(state,result);
     }
     const pendingPath = join(home, 'join-' + room + '.json');
-    const fingerprint = createHash('sha256').update(inviteUrl).digest('hex');
+    const fingerprint = createHash('sha256').update(origin + '/r/' + room + '#' + inviteSecret).digest('hex');
     let pending = await readJson(pendingPath);
     if (!pending || pending.fingerprint !== fingerprint) {
       pending = { fingerprint, displayName: name, requestId:randomUUID() };
@@ -427,10 +468,10 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     await writeJson(pendingPath, pending);
     async function admit() {
       // v1 hosts do not understand requestId. Only retry an ambiguous delivery on v2.
-      const request = { inviteSecret, displayName:pending.displayName, requestId:pending.requestId };
+      const request = { inviteSecret, displayName:pending.displayName, requestId:pending.requestId, ...(handoff && {handoff}) };
       try { return await rpc(origin, room, 'join', undefined, request); }
       catch (error) {
-        if (error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName:pending.displayName });
+        if (!handoff && error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName:pending.displayName });
         if (error.message.startsWith('Could not reach')) return rpc(origin, room, 'join', undefined, request);
         throw error;
       }
@@ -448,7 +489,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     await rm(pendingPath, {force:true});
     progress(55, 'Joined');
     const result = await install(state);
-    return readyView(state,{ ...result, sharing },openPreview,progress);
+    return finishJoin(state,{ ...result, sharing });
   }
 
   const editingTimers = new Map();

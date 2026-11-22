@@ -5,6 +5,7 @@ import { pipeline } from 'node:stream/promises';
 import { lstat, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { openDocumentStore } from './document-store.mjs';
+import { lockProject, prepareProject } from './project-continuity.mjs';
 import { createHistory, scanTree } from './project.mjs';
 import { projectAsset, projectAssetBytes, projectAssetPolicy } from './project-assets.mjs';
 import { invalidDisplayName, normalizeDisplayName } from './display-name.mjs';
@@ -14,6 +15,7 @@ const assets = new Map([
   ['/invite.mjs', 'invite.mjs'],
   ['/display-name.mjs', new URL('./display-name.mjs', import.meta.url)],
   ['/join.js', 'join.js'],
+  ['/browser-handoff.mjs', 'browser-handoff.mjs'],
   ['/app-bridge.mjs', 'app-bridge.mjs'],
 ]);
 const downloads = new Set([
@@ -66,6 +68,13 @@ function sameSecret(a,b) {
   if (typeof a!=='string') return false;
   const given=Buffer.from(a), known=Buffer.from(b);
   return given.length===known.length && timingSafeEqual(given,known);
+}
+function peerAddress(req) {
+  const address = req.socket.remoteAddress?.replace(/^::ffff:/,'');
+  return address === '::1' ? '127.0.0.1' : address;
+}
+function checkPeer(record,req) {
+  if (record && record.peer !== peerAddress(req)) throw fail(403,'Tab requires the same device connection.');
 }
 function loopback(host) {return ['127.0.0.1','localhost','::1','[::1]'].includes(host);}
 function snapshotBytes({ rev, oid, tree }) {
@@ -143,7 +152,13 @@ async function asset(res, file, type, policy) {
 }
 const shellPolicy="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self' http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:*; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-export async function startHost({source, storage, displayName, bind='127.0.0.1',port=0,publicOrigin,releaseDirectory=process.env.PARCHEH_RELEASE_DIR}) {
+export async function startHost(options) {
+  const lock = options.continuityHome && await lockProject(options.continuityHome,options.source);
+  try { return await serveHost(options,lock); }
+  catch (error) { lock?.close(); throw error; }
+}
+
+async function serveHost({source, storage, continuityHome, continueFromRoom, displayName, bind='127.0.0.1',port=0,publicOrigin,releaseDirectory=process.env.PARCHEH_RELEASE_DIR},lock) {
   if (bind==='[::1]') bind='::1';
   const advertised=publicAddress(bind,publicOrigin);
   const advertiseBoundPort=advertised && new URL(advertised).port==='0';
@@ -153,7 +168,8 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   }
   if (!Number.isInteger(Number(port))||Number(port)<0||Number(port)>65535) throw Error('Invalid listening port.');
   const hostName=nameOf(displayName);
-  const tree=await scanTree(source);
+  const continuation=continuityHome && await prepareProject(continuityHome,source,continueFromRoom);
+  const tree=continuation?.tree ?? await scanTree(source);
   await mkdir(dirname(storage),{recursive:true,mode:0o700});
   const history=await createHistory(storage,tree,hostName);
   let current=await history.head(), config=shareConfig(current.tree), currentBytes=snapshotBytes(current);
@@ -185,7 +201,9 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   }
   let baseUrl, localBaseUrl, sequence=0;
   const scopeRules=Object.fromEntries(Object.entries(tree).filter(([path])=>path.split('/').at(-1)==='.gitignore'));
-  const roomId=randomUUID(), inviteSecret=token(), expires=Date.now()+8*60*60*1000;
+  const roomId = randomUUID();
+  const inviteLifetime = 8 * 60 * 60 * 1000;
+  let inviteSecret = token(), expires = Date.now() + inviteLifetime;
   let documents;
   function documentStore() {
     if (!documents) {
@@ -198,6 +216,14 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   let assetToken=token();
   const members=[], grants=new Map(), pointers=new Map(), lastSeen=new Map(), actions=[];
   const sharingByMember=new Map(), editing=new Map(), joinReceipts=new Map();
+  const handoffs = new Map();
+  const handoffWindow = 10 * 60_000;
+  function liveHandoff(id) {
+    if (typeof id !== 'string' || !/^[0-9a-f]{48}$/.test(id)) throw fail(400,'Invalid tab handoff.');
+    const now = Date.now();
+    for (const [key, record] of handoffs) if (record.expires <= now) handoffs.delete(key);
+    return handoffs.get(id);
+  }
   const inviteUrl=()=>baseUrl+'/r/'+roomId+'#'+inviteSecret;
   const pointerStreams = new Set();
   function visiblePointers(member, now = Date.now()) {
@@ -366,17 +392,60 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       const prefix='/api/rooms/'+roomId+'/';
       if (!path.startsWith(prefix)) throw fail(404,'Unknown room or endpoint.');
       const route=path.slice(prefix.length);
+      if (['tab-register','tab-receive','tab-ack'].includes(route) && req.method === 'POST') {
+        const msg = await jsonBody(req);
+        fields(msg, ['id','receipt'],route === 'tab-register' ? [] : ['claim']);
+        if (route !== 'tab-register' && !/^[a-f0-9]{48}$/.test(msg.claim)) throw fail(400,'Invalid tab claim.');
+        const secret = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+        if (Date.now() > expires || !sameSecret(secret, inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+        if (typeof msg.receipt !== 'string' || !/^[a-f0-9]{64}$/.test(msg.receipt)) throw fail(400,'Invalid receipt.');
+        let record = liveHandoff(msg.id);
+        checkPeer(record,req);
+        if (route === 'tab-register' && !record) {
+          if (handoffs.size >= 512) throw fail(429,'Too many waiting tabs.');
+          record = {receipt:msg.receipt, peer:peerAddress(req), expires:Date.now()+handoffWindow};
+          handoffs.set(msg.id,record);
+        }
+        if (!record) throw fail(410,'Expired tab handoff.');
+        if (!sameSecret(msg.receipt,record.receipt)) throw fail(403,'Invalid receipt.');
+        if (record.claim && record.claim !== msg.claim && route !== 'tab-register') throw fail(409,'Tab grant already claimed.');
+        if (route === 'tab-ack' && record.claim === msg.claim) {
+          record.delivered = true;
+          delete record.browserToken;
+          delete record.app;
+          record.expires = Math.min(expires,Date.now()+handoffWindow);
+        }
+        if (route === 'tab-receive' && record.member && !record.delivered) {
+          if (!record.claim) {
+            record.claim = msg.claim;
+            record.browserToken = token();
+            grants.set(record.browserToken,{member:record.member,role:'browser'});
+          }
+          if (record.browserToken) return json({browserToken:record.browserToken,...(record.app && {app:record.app})});
+        }
+        return json({expires:record.expires});
+      }
       if(route==='join' && req.method==='POST'){
-        const msg=await jsonBody(req); fields(msg,['inviteSecret','displayName'],['requestId']);
+        const msg=await jsonBody(req); fields(msg,['inviteSecret','displayName'],['requestId','handoff']);
         if (Date.now()>expires||!sameSecret(msg.inviteSecret,inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+        const tab = msg.handoff !== undefined ? liveHandoff(msg.handoff) : null;
+        checkPeer(tab,req);
+        if (msg.handoff !== undefined && !tab) throw fail(410,'Expired tab handoff.');
+        if (tab && (!msg.requestId || (tab.requestId && tab.requestId !== msg.requestId) || tab.member)) {
+          throw fail(409,'Tab already admitted.');
+        }
         const name=nameOf(msg.displayName);
         if(msg.requestId===undefined) return json(addMember(name));
         if(typeof msg.requestId!=='string' || !uuid.test(msg.requestId)) throw fail(400,'Invalid join request ID.');
         const key=msg.requestId.toLowerCase();
         const previous=joinReceipts.get(key);
         if(previous && previous.name!==name) throw fail(409,'This join request already belongs to another name.');
-        if(previous) return json(previous.receipt);
+        if(previous) {
+          if (tab) tab.requestId = key;
+          return json(previous.receipt);
+        }
         const receipt=addMember(name);
+        if (tab) tab.requestId = key;
         joinReceipts.set(key,{name,receipt});
         return json(receipt);
       }
@@ -384,6 +453,24 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
       if (!req.headers.authorization?.startsWith('Bearer ')||!grant) throw fail(403,'Room credential required.');
       const browser=['activity','live','pointers','config','document','invite'].includes(route);
       if (grant.role!==(browser?'browser':'editor')) throw fail(403,'Wrong credential for this operation.');
+      if (route === 'tab-confirm' && req.method === 'POST') {
+        const msg = await jsonBody(req);
+        fields(msg,['id','inviteSecret'],['app']);
+        if (Date.now() > expires || !sameSecret(msg.inviteSecret,inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+        const record = liveHandoff(msg.id);
+        if (!record) throw fail(410,'Expired tab handoff.');
+        checkPeer(record,req);
+        if (record.requestId && joinReceipts.get(record.requestId)?.receipt.memberToken !== req.headers.authorization.slice(7)) throw fail(409,'Tab already admitted.');
+        if (record.member && record.member !== grant.member) throw fail(409,'Tab already admitted.');
+        let app;
+        if (msg.app !== undefined) {
+          try { app = new URL(msg.app); } catch { throw fail(400,'Invalid local preview.'); }
+          if (!['http:','https:'].includes(app.protocol) || !['127.0.0.1','localhost'].includes(app.hostname) ||
+              app.username || app.password || app.hash || [baseUrl,localBaseUrl].includes(app.origin)) throw fail(400,'Invalid local preview.');
+        }
+        if (!record.member) Object.assign(record,{member:grant.member,expires,...(app && {app:app.href})});
+        return json({confirmed:true});
+      }
       if (req.method==='GET') {
         if(route==='snapshot') {
           holdResponse(res,currentBytes);
@@ -420,6 +507,15 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
             pointers:visiblePointers(grant.member,now),
           });
         }
+      }
+      if (req.method === 'POST' && route === 'host-invite') {
+        if (grant.member !== members[0]) throw fail(403,'Only the host can renew an invitation.');
+        fields(await jsonBody(req),[]);
+        if (Date.now() > expires) {
+          inviteSecret = token();
+          expires = Date.now() + inviteLifetime;
+        }
+        return json({inviteUrl:inviteUrl()});
       }
       if(req.method==='POST' && route==='close'){
         if(grant.member.id!==members[0].id) throw fail(403,'Only the host can close the room.');
@@ -489,6 +585,18 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
   const localHost=bind==='0.0.0.0'?'127.0.0.1':(bind==='::'||bind==='::1'?'[::1]':bind);
   localBaseUrl='http://'+localHost+':'+server.address().port;
   baseUrl=advertiseBoundPort ? localBaseUrl : advertised || localBaseUrl;
+  try {
+    if (config?.document && continuation?.documents) {
+      const file = await lstat(continuation.documents).catch(e => { if (e.code !== 'ENOENT') throw e; });
+      if (file?.isFile()) documentStore().inherit(continuation.documents, config.document,
+        (action,payload)=>validatedPayload(config,action,payload));
+    }
+    continuation?.publish(roomId,storage);
+  } catch (error) {
+    documents?.close();
+    await new Promise(done=>server.close(done));
+    throw error;
+  }
   const owner=addMember(hostName);
   const pointerHeartbeat=setInterval(()=>{ for(const client of pointerStreams) client.send(true); },1000);
   pointerHeartbeat.unref();
@@ -500,6 +608,7 @@ export async function startHost({source, storage, displayName, bind='127.0.0.1',
     server.close(()=>{
       documents?.close();
       documents=undefined;
+      if (lock?.isOpen) lock.close();
       resolve();
     });
     server.closeAllConnections();

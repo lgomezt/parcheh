@@ -1,3 +1,4 @@
+import { mountInvite } from './invite.mjs';
 import { sharedAction, validCoordinates } from './app-bridge.mjs';
 
 const room = /^\/view\/([a-z0-9-]+)$/.exec(location.pathname)?.[1];
@@ -49,9 +50,11 @@ function browserSettings(room) {
 function openProject(roomId) {
   const { token, app } = browserSettings(roomId);
   if (!token) return;
+  mountInvite(roomId,token).catch(() => {});
   const frame = document.querySelector('iframe');
   const api = `/api/rooms/${encodeURIComponent(roomId)}`;
   let project;
+  let sourceMessage;
   let navigation;
   let bridge;
   let visibilityEpoch = 0;
@@ -213,6 +216,16 @@ function openProject(roomId) {
     if (!url && typeof next.entryUrl === 'string' && next.entryUrl.startsWith('/')) {
       const entry = new URL(next.entryUrl, location.origin);
       if (entry.origin === location.origin && !entry.username && !entry.password) url = entry;
+    }
+    if (!url && !sourceMessage) {
+      sourceMessage = document.createElement('p');
+      sourceMessage.setAttribute('role','status');
+      sourceMessage.textContent = 'Your files are ready in your agent. The project preview will appear here when available.';
+      sourceMessage.style.cssText = 'position:absolute;top:1rem;left:1rem;margin:0;font:1rem/1.5 system-ui';
+      document.body.append(sourceMessage);
+    } else if (url && sourceMessage) {
+      sourceMessage.remove();
+      sourceMessage = undefined;
     }
     if (navigation?.href === url?.href) return;
     detach();

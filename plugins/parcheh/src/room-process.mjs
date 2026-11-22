@@ -14,7 +14,7 @@ export function launchHost(options) {
     child.once('error',fail);child.once('exit',exited);
     child.once('message',msg=>{
       finish();
-      if(!msg.ok){child.kill();return reject(Error(msg.message||'Room startup failed.'));}
+      if(!msg.ok){child.kill();return reject(Object.assign(Error(msg.message||'Room startup failed.'),{code:msg.code}));}
       child.disconnect();child.unref();
       const result=msg.result;
       const close=async()=>{await fetch(result.localBaseUrl+'/api/rooms/'+result.roomId+'/close',{
@@ -30,6 +30,6 @@ if(process.argv[1] && pathToFileURL(process.argv[1]).href===import.meta.url && p
     try {
       const {close,...result}=await startHost(options);
       process.send({ok:true,result},err=>{if(err)close();});
-    }catch(err){process.send({ok:false,message:err.message},()=>process.exit(1));}
+    }catch(err){process.send({ok:false,message:err.message,code:err.code},()=>process.exit(1));}
   });
 }

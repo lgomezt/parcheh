@@ -25,6 +25,24 @@ export function openDocumentStore(path) {
 
   return {
     head,
+    inherit(source, document, validate) {
+      const previous = new DatabaseSync(source, {readOnly:true});
+      try {
+        db.exec('BEGIN IMMEDIATE');
+        let seq=0;
+        for (const row of previous.prepare('SELECT * FROM operations WHERE documentId=? ORDER BY seq').iterate(document.id)) {
+          if (!document.actions.includes(row.actionId)) continue;
+          let payload;
+          try { payload=validate(row.actionId,JSON.parse(row.payload)); } catch { continue; }
+          if (++seq > MAX_OPERATIONS) throw fail(507,'The room drawing history is full.');
+          insert.run(document.id,seq,row.id,row.memberId,row.name,row.actionId,JSON.stringify(payload));
+        }
+        db.exec('COMMIT');
+      } finally {
+        if (db.isTransaction) db.exec('ROLLBACK');
+        previous.close();
+      }
+    },
     append(documentId, member, id, actionId, payload) {
       const encoded = JSON.stringify(payload);
       db.exec('BEGIN IMMEDIATE');
