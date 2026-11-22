@@ -8,13 +8,11 @@ Start with a new project or one you already have. Share one link, ask your own a
 
 [Install parcheh](#installation) in Codex, Claude Code, Antigravity, or another coding tool that supports local MCP servers.
 
-## Join and make your first edit
+## How to use it
 
-Open the invitation, choose Claude Code or Codex and send the prepared request. Return to the invitation tab to see the room. For another compatible coding agent, choose Other and copy the prompt. You can share the project address directly from your browser. You can also paste the full invitation directly into a local coding chat. Your project preview opens with shared cursors and the project’s declared interactions already on. In a drawing app, both people can draw together immediately. You can include a first edit in that message, such as “Add a star sticker.”
-
-When the host reopens the same project folder, the next session carries forward its accepted source, change history and declared shared documents. Private form fields stay local. Ask your agent to hide your cursor or turn off action sharing whenever you want.
-
-Use your friend's invitation only in your coding chat. This public repository distributes the plugin. Your shared project and room data live on the participating computers.
+1. Ask your coding agent to start a parcheh room with your project.
+2. Copy the room link and share it with your collaborator.
+3. Have your collaborator open the link and ask their own coding agent to join and make a first edit.
 
 ## Installation
 
