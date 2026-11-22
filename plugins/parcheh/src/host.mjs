@@ -18,6 +18,11 @@ const assets = new Map([
   ['/browser-handoff.mjs', 'browser-handoff.mjs'],
   ['/app-bridge.mjs', 'app-bridge.mjs'],
 ]);
+const inviteBrandAssets = new Map([
+  ['/invite-brand/mark.png', 'image/png'],
+  ['/invite-brand/paint.jpg', 'image/jpeg'],
+  ['/invite-brand/instrument-sans.ttf', 'font/ttf'],
+]);
 const downloads = new Set([
   'parcheh-claude-code-macos-arm64.zip',
   'parcheh-codex-macos-arm64.zip',
@@ -147,7 +152,7 @@ function validatedPayload(config, actionId, payload) {
 
 async function asset(res, file, type, policy) {
   const data=await readFile(new URL(file, new URL('../web/v2/', import.meta.url)));
-  res.writeHead(200,{'content-type':type+'; charset=utf-8','content-security-policy':policy});
+  res.writeHead(200,{'content-type':type.startsWith('text/') ? type+'; charset=utf-8' : type,'content-security-policy':policy});
   res.end(data);
 }
 const shellPolicy="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self' http://localhost:* https://localhost:* http://127.0.0.1:* https://127.0.0.1:*; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -379,7 +384,8 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
       }
       if(req.headers.origin && ![baseUrl,localBaseUrl].includes(req.headers.origin)) throw fail(403,'Unknown origin.');
       if(req.method==='GET') {
-        if(path==='/r/'+roomId) return await asset(res,'join.html','text/html',shellPolicy + '; img-src blob:');
+        if(path==='/r/'+roomId) return await asset(res,'join.html','text/html',shellPolicy + "; img-src 'self' blob:; font-src 'self'");
+        if(inviteBrandAssets.has(path)) return await asset(res,path.slice(1),inviteBrandAssets.get(path),shellPolicy);
         if (path === '/downloads') {
           const files = releaseDirectory ? await Promise.all([...downloads].map(async name => {
             const stat = await lstat(join(releaseDirectory, name)).catch(() => null);

@@ -212,7 +212,13 @@ function openProject(roomId) {
     project = next;
     if (previous?.rev !== next.rev) resetBridge();
 
-    let url = app;
+    let url = app ? new URL(app.href) : null;
+    let bridgeToken;
+    if (url) {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      bridgeToken = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      url.hash = 'parcheh-bridge=' + bridgeToken;
+    }
     if (!url && typeof next.entryUrl === 'string' && next.entryUrl.startsWith('/')) {
       const entry = new URL(next.entryUrl, location.origin);
       if (entry.origin === location.origin && !entry.username && !entry.password) url = entry;
@@ -242,6 +248,7 @@ function openProject(roomId) {
       origin: app ? url.origin : 'null',
       projectDirectory: app ? null : new URL('.', url).pathname,
       challenge: null,
+      bridgeToken: bridgeToken || null,
     };
     frame.setAttribute('sandbox', app ? 'allow-scripts allow-same-origin allow-forms' : 'allow-scripts');
     frame.src = url.href;
@@ -250,7 +257,11 @@ function openProject(roomId) {
   function probe() {
     if (!navigation?.challenge) return;
     frame.contentWindow.postMessage(
-      { type: 'parcheh:probe', challenge: navigation.challenge },
+      {
+        type: 'parcheh:probe',
+        challenge: navigation.challenge,
+        ...(navigation.bridgeToken && { bridgeToken: navigation.bridgeToken }),
+      },
       navigation.origin === 'null' ? '*' : navigation.origin,
     );
   }
@@ -287,7 +298,11 @@ function openProject(roomId) {
     changeTitle(data.title);
     opened.port.onmessage = ({ data: message }) => receive(opened, message);
     frame.contentWindow.postMessage(
-      { type: 'parcheh:connected', challenge: expected.challenge },
+      {
+        type: 'parcheh:connected',
+        challenge: expected.challenge,
+        ...(expected.bridgeToken && { bridgeToken: expected.bridgeToken }),
+      },
       expected.origin === 'null' ? '*' : expected.origin,
       [channel.port2],
     );

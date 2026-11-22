@@ -52,7 +52,7 @@ function mount() {
   for (const choice of choices) choice.onclick = async () => {
     const attempt = ++interaction;
     selection = choice;
-    other.setAttribute('aria-pressed', String(choice === other));
+    for (const option of choices) option.setAttribute('aria-pressed', String(option === choice));
     status.textContent = '';
     prompt.hidden = true;
     manual.value = '';

@@ -14,6 +14,8 @@ const OMIT = new Set([
   '.git', '.gitmodules', '.parcheh', '.claude', '.cursor', '.codex', '.agents', '.ai',
   '.gemini', '.windsurf', '.continue', '.aider', '.mcp.json', '.vscode', '.idea',
   'agents.md', 'claude.md', 'gemini.md', '.claude.json', '.codex.json',
+  '.cursorrules', '.clinerules', '.roorules', '.windsurfrules', 'copilot-instructions.md',
+  '.github', '.husky', '.cargo', '.direnv',
   '.ssh', '.aws', '.gnupg', '.kube', '.docker', '.terraform', '.config', '.azure',
   '.password-store', '.1password', 'keychains',
   '.netrc', '.git-credentials', '.gitconfig', '.npmrc', '.pypirc', '.yarnrc',
@@ -22,6 +24,17 @@ const OMIT = new Set([
   '.venv', 'venv', '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache',
 ]);
 
+const SECRET_PATTERNS = [
+  { kind: 'anthropic-api-key', pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}/ },
+  { kind: 'openai-api-key', pattern: /\bsk-(?:proj|live|svcacct)-[A-Za-z0-9_-]{20,}/ },
+  { kind: 'google-api-key', pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { kind: 'github-token', pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b/ },
+  { kind: 'aws-access-key', pattern: /\bAKIA[0-9A-Z]{16}\b/ },
+  { kind: 'private-key-pem', pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----/ },
+];
+
+const BUILD_CONFIG_PATTERN = /^(?:package\.json|(?:vite|next|postcss|tailwind|webpack|rollup|astro|svelte|nuxt)\.config\.[a-z0-9]+|Makefile|Dockerfile)$/i;
+
 function fold(name) {
   return name.normalize('NFD').toUpperCase().toLowerCase();
 }
@@ -29,7 +42,7 @@ function fold(name) {
 function omittedSegment(segment) {
   const name = fold(segment).replace(/\p{Default_Ignorable_Code_Point}/gu, '');
   return OMIT.has(name)
-    || /^(?:\.parcheh-|\.aider[.-]|\.cursor[.-]|\.windsurf[.-])/.test(name)
+    || /^(?:\.parcheh-|\.aider[.-]|\.cursor[.-]|\.cline[.-]|\.roo[.-]|\.windsurf[.-])/.test(name)
     || (/^\.env(?:[.-]|$)/.test(name) && !/^\.env\.(?:example|sample|template)$/.test(name))
     || /^(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|(?:secret|secrets|credentials)\.[^.]+)$/.test(name)
     || /\.(?:pem|key|p12|pfx|keystore)$/.test(name)
@@ -402,4 +415,39 @@ export function treeDifference(base, edited) {
 
 export async function diffTrees(base, edited) {
   return treeDifference(Object.fromEntries(checkedEntries(base)), Object.fromEntries(checkedEntries(edited)));
+}
+
+export function inspectTreeRisks(tree, changedPaths = Object.keys(tree)) {
+  const secretWarnings = [];
+  const buildConfigPaths = [];
+  if (!tree || typeof tree !== 'object') return { secretWarnings, buildConfigPaths };
+
+  const paths = [...new Set(changedPaths)].sort();
+  for (const name of paths) {
+    const entry = tree[name];
+    if (!entry || typeof entry.data !== 'string') continue;
+
+    const base = path.posix.basename(name);
+    if (BUILD_CONFIG_PATTERN.test(base)) {
+      buildConfigPaths.push(name);
+    }
+
+    if (/\.(?:example|sample|template)$/i.test(base)) continue;
+
+    const bytes = Buffer.from(entry.data, 'base64');
+    if (bytes.length > 2 * MiB) continue;
+
+    const text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) continue;
+
+    for (const { kind, pattern } of SECRET_PATTERNS) {
+      if (pattern.test(text)) {
+        secretWarnings.push({ path: name, kind });
+      }
+    }
+  }
+
+  secretWarnings.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.kind < b.kind ? -1 : Number(a.kind > b.kind)));
+  buildConfigPaths.sort();
+  return { secretWarnings, buildConfigPaths };
 }

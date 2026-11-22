@@ -5,7 +5,7 @@ import {
   checkedEntries, entriesEqual, fault, git, isIgnoreFile, localPath, treeDifference, withIgnoreRules,
 } from './project-tree.mjs';
 
-export { diffTrees, materialize, scanTree } from './project-tree.mjs';
+export { diffTrees, inspectTreeRisks, materialize, scanTree } from './project-tree.mjs';
 
 const HEAD = 'refs/heads/room';
 const FORMAT = 1;

@@ -1,11 +1,11 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
 import { homedir, networkInterfaces, userInfo } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { checkSourceRoot } from './project-tree.mjs';
 import { draftFiles } from './desktop-draft.mjs';
@@ -253,6 +253,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   const allowLanHttp = env.PARCHEH_ALLOW_LAN_HTTP === '1';
   const statePath = (room) => join(home, 'room-' + room + '.json');
   const turnPath = (state, kind) => join(home, 'turn-' + state.turn.id + '-' + kind + '.json');
+  const liveTreePath = (state) => join(home, 'room-' + state.room + '-live.json');
   const save = (state) => writeJson(statePath(state.room), state);
 
   async function load(room) {
@@ -295,14 +296,97 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return remote;
   }
 
+  async function syncLiveDirectory(state, remoteTree) {
+    const livePath = join(state.folder, 'live');
+    const treePath = liveTreePath(state);
+    const liveStat = await lstat(livePath).catch(() => null);
+    const hasLegacyPath = state.accepted?.path && state.accepted.path !== livePath;
+
+    if (!liveStat?.isDirectory() || hasLegacyPath) {
+      await rm(livePath, { recursive: true, force: true }).catch(() => {});
+      const { materialize } = await import('./project.mjs');
+      await materialize(livePath, remoteTree);
+      await writeJson(treePath, remoteTree);
+      return livePath;
+    }
+
+    const previousTree = await readJson(treePath);
+    if (!previousTree) {
+      await rm(livePath, { recursive: true, force: true }).catch(() => {});
+      const { materialize } = await import('./project.mjs');
+      await materialize(livePath, remoteTree);
+      await writeJson(treePath, remoteTree);
+      return livePath;
+    }
+
+    const { entriesEqual } = await import('./project-tree.mjs');
+
+    for (const [name, prevEntry] of Object.entries(previousTree)) {
+      if (!Object.hasOwn(remoteTree, name) || !entriesEqual(prevEntry, remoteTree[name])) {
+        const filePath = join(livePath, name);
+        const stat = await lstat(filePath).catch(() => null);
+        if (stat?.isFile()) {
+          const diskBytes = await readFile(filePath);
+          const diskExec = Boolean(stat.mode & 0o111);
+          const prevBytes = Buffer.from(prevEntry.data, 'base64');
+          if (!diskBytes.equals(prevBytes) || diskExec !== prevEntry.executable) {
+            const preserved = join(state.folder, 'preserved-local', name);
+            await mkdir(dirname(preserved), { recursive: true, mode: 0o700 });
+            await writeFile(preserved, diskBytes, { mode: diskExec ? 0o700 : 0o600 });
+          }
+        }
+      }
+    }
+
+    const remoteKeys = Object.keys(remoteTree);
+    for (const name of Object.keys(previousTree)) {
+      const isDeleted = !Object.hasOwn(remoteTree, name);
+      const isDisplacedByDir = remoteKeys.some((k) => k.startsWith(name + '/'));
+      const isDisplacedByFile = remoteKeys.some((k) => name.startsWith(k + '/'));
+      if (isDeleted || isDisplacedByDir || isDisplacedByFile) {
+        await rm(join(livePath, name), { force: true });
+        let dir = dirname(join(livePath, name));
+        while (dir !== livePath && inside(livePath, dir)) {
+          try {
+            await rmdir(dir);
+            dir = dirname(dir);
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+
+    for (const [name, entry] of Object.entries(remoteTree)) {
+      if (Object.hasOwn(previousTree, name) && entriesEqual(previousTree[name], entry)) {
+        continue;
+      }
+      const target = join(livePath, name);
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      const tempPath = join(dirname(target), '.parcheh-sync-' + randomUUID() + '.tmp');
+      const mode = entry.executable ? 0o700 : 0o600;
+      try {
+        await writeFile(tempPath, Buffer.from(entry.data, 'base64'), { mode });
+        await chmod(tempPath, mode);
+        await rename(tempPath, target);
+      } finally {
+        await rm(tempPath, { force: true }).catch(() => {});
+      }
+    }
+
+    await writeJson(treePath, remoteTree);
+    return livePath;
+  }
+
   async function refresh(state, remote) {
     const current = revision(remote);
-    if (state.accepted?.rev === current.rev && state.accepted.oid === current.oid && typeof state.accepted.hasWebEntry === 'boolean') {
+    const livePath = join(state.folder, 'live');
+    if (state.accepted?.rev === current.rev && state.accepted.oid === current.oid && state.accepted.path === livePath && typeof state.accepted.hasWebEntry === 'boolean') {
       if (await realpath(state.accepted.path).catch(() => null) === state.accepted.path &&
           (await lstat(state.accepted.path)).isDirectory()) return;
     }
     if (state.accepted && current.rev < state.accepted.rev) throw new Error('The parcheh host returned an older revision.');
-    const path = await createCopy(state.folder, 'rev-' + current.rev + '-', remote.tree);
+    const path = await syncLiveDirectory(state, remote.tree);
     state.accepted = { ...current, path, hasWebEntry: Object.hasOwn(remote.tree, 'index.html') };
     await save(state);
   }
@@ -326,7 +410,16 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       excluded[reason] = (excluded[reason] || 0) + 1;
     });
     const names = Object.keys(files).sort();
-    return {fileCount:names.length, bytes:Object.values(files).reduce((n,f)=>n+Buffer.byteLength(f.data,'base64'),0), paths:names, excluded};
+    const { inspectTreeRisks } = await import('./project.mjs');
+    const { secretWarnings, buildConfigPaths } = inspectTreeRisks(files);
+    return {
+      fileCount: names.length,
+      bytes: Object.values(files).reduce((n, f) => n + Buffer.byteLength(f.data, 'base64'), 0),
+      paths: names,
+      excluded,
+      ...(secretWarnings.length && { secretWarnings }),
+      ...(buildConfigPaths.length && { buildConfigPaths }),
+    };
   }
 
   async function browserSettings(state, { pointers, actions }, fresh = false) {
@@ -431,7 +524,16 @@ export async function openClient(env = process.env, { getRoots = async () => [],
         const {latestRoom}=await import('./project-continuity.mjs');
         if (await latestRoom(home,selected)!==state.room) throw error;
       }
-      return { ...await readyView(state,local,openPreview,progress), sharing, inviteUrl: host.inviteUrl };
+      const initialTree = await readJson(liveTreePath(state));
+      const { inspectTreeRisks } = await import('./project.mjs');
+      const { secretWarnings, buildConfigPaths } = inspectTreeRisks(initialTree || {});
+      return {
+        ...await readyView(state,local,openPreview,progress),
+        sharing,
+        inviteUrl: host.inviteUrl,
+        ...(secretWarnings.length && { secretWarnings }),
+        ...(buildConfigPaths.length && { buildConfigPaths }),
+      };
     } catch (error) {
       await host.close().catch(() => {});
       throw error;
@@ -539,6 +641,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     const state = await load(room);
     if (state.closed) throw new Error('This parcheh room is closed.');
     if (!state.turn && !state.lastReceipt) throw new Error('Start a turn before finishing it.');
+    let submittedChanges;
     if (state.turn) {
       const submissionPath = turnPath(state, 'submission');
       const basePath = turnPath(state, 'base');
@@ -568,6 +671,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
           await writeJson(submissionPath, body);
         }
       }
+      if (body?.changes) submittedChanges = body.changes;
       let receipt = { outcome: 'no_change', rev: state.accepted.rev, oid: state.accepted.oid };
       await signalEditing(state, false);
       if (body) {
@@ -580,10 +684,15 @@ export async function openClient(env = process.env, { getRoots = async () => [],
           return { room, outcome: 'pending', submissionId: id, workspace: state.turn.path, message: error.message };
         }
       }
+      const turnStage = dirname(state.turn.path);
       state.lastReceipt = receipt;
       delete state.turn;
       await save(state);
-      await Promise.allSettled([rm(basePath, { force: true }), rm(submissionPath, { force: true })]);
+      await Promise.allSettled([
+        rm(basePath, { force: true }),
+        rm(submissionPath, { force: true }),
+        rm(turnStage, { recursive: true, force: true }),
+      ]);
     }
     let refreshError;
     try {
@@ -591,7 +700,23 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     } catch (error) {
       refreshError = error.message;
     }
-    return { ...workspaceInfo(state), ...state.lastReceipt, ...browserView(state), ...(refreshError && { refreshError }) };
+    let secretWarnings;
+    let buildConfigPaths;
+    if (submittedChanges) {
+      const { inspectTreeRisks } = await import('./project.mjs');
+      const changedEntries = Object.fromEntries(Object.entries(submittedChanges).filter(([, e]) => e !== null));
+      const risks = inspectTreeRisks(changedEntries);
+      secretWarnings = risks.secretWarnings;
+      buildConfigPaths = risks.buildConfigPaths;
+    }
+    return {
+      ...workspaceInfo(state),
+      ...state.lastReceipt,
+      ...browserView(state),
+      ...(refreshError && { refreshError }),
+      ...(secretWarnings?.length && { secretWarnings }),
+      ...(buildConfigPaths?.length && { buildConfigPaths }),
+    };
   }
 
   async function room_status({ room }) {

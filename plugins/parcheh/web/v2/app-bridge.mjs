@@ -19,17 +19,55 @@ export function sharedAction(actionIds, payloads, actionId, payload) {
   return { actionId, payload: Object.fromEntries(fields.map((key) => [key, payload[key]])) };
 }
 
+export function cursorColor(index) {
+  const base = ['#6941c6', '#006b75', '#b23d1a', '#a12a72'];
+  if (Number.isInteger(index) && index >= 0 && index < base.length) return base[index];
+  if (Number.isInteger(index) && index >= base.length) {
+    return `hsl(${Math.round(index * 137.508) % 360} 68% 36%)`;
+  }
+  return '#6941c6';
+}
+
+export function trustedRoomOrigin(roomOriginParam, pageOrigin) {
+  if (typeof roomOriginParam !== 'string' || !roomOriginParam) return null;
+  let url;
+  try {
+    url = new URL(roomOriginParam);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  const isPrivateLan = /^(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}$/.test(hostname)
+    || /^\[?f[cd][0-9a-f]{2}:/i.test(url.hostname);
+  if (url.origin === pageOrigin || isLoopback || isPrivateLan) {
+    return url.origin;
+  }
+  return null;
+}
+
 let currentBridge;
 
 export function connectParcheh({ stage, parentOrigin } = {}) {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
   const pageUrl = new URL(location.href);
-  const localRoom = window.origin === 'null' ? null : pageUrl.searchParams.get('roomOrigin');
   let expected;
-  try {
-    expected = new URL(parentOrigin || localRoom || pageUrl.origin).origin;
-  } catch {
-    return () => {};
+  if (parentOrigin) {
+    try {
+      expected = new URL(parentOrigin).origin;
+    } catch {
+      return () => {};
+    }
+  } else if (window.origin !== 'null' && pageUrl.searchParams.has('roomOrigin')) {
+    expected = trustedRoomOrigin(pageUrl.searchParams.get('roomOrigin'), pageUrl.origin);
+    if (!expected) return () => {};
+  } else {
+    try {
+      expected = new URL(pageUrl.origin).origin;
+    } catch {
+      return () => {};
+    }
   }
   if (currentBridge?.origin === expected) {
     if (stage instanceof HTMLElement) currentBridge.stage = stage;
@@ -37,6 +75,7 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
   }
   currentBridge?.disconnect();
 
+  const bridgeSecret = window.origin === 'null' ? null : new URLSearchParams(pageUrl.hash.slice(1)).get('parcheh-bridge');
   let challenge;
   let port;
   let sharing = noSharing;
@@ -48,7 +87,6 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
   let peers = [];
   let overlay;
   const markers = new Map();
-  const cursorColors = ['#6941c6', '#006b75', '#b23d1a', '#a12a72'];
   const listeners = new AbortController();
   const { signal } = listeners;
   const bridge = { origin: expected, stage, disconnect };
@@ -138,7 +176,7 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
       const y = bounds.top + (positioned ? peer.y * bounds.height : 8 + 22 * corner++);
       marker.style.transform = `translate(${x}px, ${y}px)`;
       marker.toggleAttribute('data-editing', peer.editing === true);
-      if (cursorColors[peer.colorIndex]) marker.style.setProperty('--cursor-color',cursorColors[peer.colorIndex]);
+      marker.style.setProperty('--cursor-color', cursorColor(peer.colorIndex));
       const label = `${peer.name}${peer.editing ? ' · Editing' : ''}`;
       if (marker.lastChild.textContent !== label) marker.lastChild.textContent = label;
     }
@@ -169,6 +207,7 @@ export function connectParcheh({ stage, parentOrigin } = {}) {
   window.addEventListener('message', (event) => {
     if (event.source !== window.parent || event.origin !== expected) return;
     const message = event.data;
+    if (bridgeSecret && message?.bridgeToken !== bridgeSecret) return;
     if (message?.type === 'parcheh:probe' && typeof message.challenge === 'string') {
       challenge = message.challenge;
       announce();
