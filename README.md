@@ -1,7 +1,24 @@
 # Parcheh for Claude Code
 
-In the **Code** tab of Claude Desktop, open the plugin manager and add the repository `https://github.com/lgomezt/parcheh-releases.git`. Install **parcheh@parcheh-pilot**. Use a local session on an Apple silicon Mac with Git available. The person installing needs GitHub read access to this repository.
+Join a friend's project from the **Code** tab of Claude Desktop. This release supports local sessions on Apple silicon Macs. Use the same Wi-Fi as your host for this pilot.
 
-Enable marketplace auto-update. After a new release downloads, reload plugins if your client offers it, or reopen Claude. The marketplace plugin takes precedence over the old Finder copy. If you separately registered the original user-level MCP, verify the marketplace plugin connects before retiring that old registration.
+## Install once
 
-Paste your room invitation and first edit into one message. The bundled Node runtime is unpacked on first use. The development project, rooms, drawings and invitations stay outside this repository.
+1. In Claude Desktop, open **Plugins** and choose **Add marketplace** or **Add from repository**. In a local Code session, the **+** menu also opens the plugin manager.
+2. Paste the publisher's address shown below. Choose **Parcheh** and click **Install**. If Claude asks to reload plugins, accept.
+
+```text
+https://github.com/lgomezt/parcheh-releases.git
+```
+
+3. In the settings for this marketplace, turn on **auto-update** to receive new releases.
+
+You can install without signing in to GitHub. This release includes Node. Parcheh uses your Mac's Git to sync project files. If Git is missing, macOS may ask to install its developer tools.
+
+## Join and make your first edit
+
+In a local Code chat, paste the full room invitation from your friend and say what you'd like to change. For example, “Join this room, share my pointer, and add a star sticker.” The personal preview opens in your browser.
+
+Use your friend's invitation only in your coding chat. This public repository distributes the plugin. Your shared project and room data live on the participating computers.
+
+[Claude Desktop plugin guide](https://code.claude.com/docs/en/desktop#install-plugins)
