@@ -1,8 +1,8 @@
 {
   "name": "parcheh",
-  "version": "0.2.3",
-  "description": "Start, join and edit a shared Parcheh project.",
+  "version": "0.2.4",
+  "description": "Collaborate on one project from your own coding agent, with live edits and shared cursors.",
   "author": {
-    "name": "Parcheh"
+    "name": "parcheh"
   }
 }

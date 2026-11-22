@@ -1,19 +1,23 @@
-# Parcheh for Claude Code
+# parcheh
 
-Join a friend's project from the **Code** tab of Claude Desktop. This release supports local sessions on Apple silicon Macs. Use the same Wi-Fi as your host for this pilot.
+Build a project together from the coding agents you already use. Share one room link, ask each agent for changes in its own chat, and see the edits and each other’s cursors in the project preview.
 
-## Install once
+parcheh handles collaboration through the Model Context Protocol (MCP). Each coding tool can have its own integration with the same room.
+
+## Install in Claude Code
+
+The public installer currently supports the **Code** tab in Claude Desktop on Apple silicon Macs. For this pilot, work on the same Wi-Fi as the host.
 
 1. In Claude Desktop, open **Plugins** and choose **Add marketplace** or **Add from repository**. In a local Code session, the **+** menu also opens the plugin manager.
-2. Paste the publisher's address shown below. Choose **Parcheh** and click **Install**. If Claude asks to reload plugins, accept.
+2. Paste the publisher's address shown below. Choose **parcheh** and click **Install**. If Claude asks to reload plugins, accept.
 
 ```text
-https://github.com/lgomezt/parcheh-releases.git
+https://github.com/lgomezt/parcheh.git
 ```
 
 3. In the settings for this marketplace, turn on **auto-update** to receive new releases.
 
-You can install without signing in to GitHub. This release includes Node. Parcheh uses your Mac's Git to sync project files. If Git is missing, macOS may ask to install its developer tools.
+You can install without signing in to GitHub. This release includes Node. parcheh uses your Mac's Git to sync project files. If Git is missing, macOS may ask to install its developer tools.
 
 ## Join and make your first edit
 

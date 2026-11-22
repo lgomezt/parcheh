@@ -8,7 +8,7 @@ try {
 } catch {}
 if (/^#[a-zA-Z0-9_-]{16,256}$/.test(link.hash)) {
   history.replaceState(null, '', link.pathname);
-  const request = 'Join this Parcheh room: ' + link.href;
+  const request = 'Join this parcheh room: ' + link.href;
   copy.hidden = false;
   copy.onclick = async () => {
     if (await copyText(request)) copy.textContent = 'Copied';

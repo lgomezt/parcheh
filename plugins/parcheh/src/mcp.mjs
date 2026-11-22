@@ -21,13 +21,13 @@ const tools = [
   },
   {
     name: 'start_room',
-    description: 'Share a selected project directory in a new Parcheh room. Returns the invitation, browser link and local accepted workspace.',
+    description: 'Share a selected project directory in a new parcheh room. Returns the invitation, browser link and local accepted workspace.',
     properties: { source: path, workspaceParent: path, displayName: name, ...browserOptions },
     required: process.env.PARCHEH_DESKTOP === '1' ? [] : ['source'],
   },
   {
     name: 'join_room',
-    description: 'Join a Parcheh room from a participant invitation and download its accepted project to a local workspace.',
+    description: 'Join a parcheh room from a participant invitation and download its accepted project to a local workspace.',
     properties: { inviteUrl: { type: 'string', format: 'uri' }, workspaceParent: path, displayName: name, ...browserOptions },
     required: ['inviteUrl'],
   },
@@ -146,7 +146,7 @@ async function handle(message) {
       return success(id, { tools: toolList });
     case 'tools/call': {
       if (!isObject(params) || typeof params.name !== 'string' || !methods.has(params.name)) {
-        return failure(id, -32602, 'Unknown Parcheh tool or invalid tool call.');
+        return failure(id, -32602, 'Unknown parcheh tool or invalid tool call.');
       }
       try {
         const args = checkedArguments(methods.get(params.name), params.arguments ?? {});
@@ -160,7 +160,7 @@ async function handle(message) {
         const result = await client[params.name](args, progress);
         return success(id, { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result });
       } catch (error) {
-        return success(id, { isError: true, content: [{ type: 'text', text: error.message || 'Parcheh tool failed.' }] });
+        return success(id, { isError: true, content: [{ type: 'text', text: error.message || 'parcheh tool failed.' }] });
       }
     }
     default:

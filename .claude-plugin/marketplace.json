@@ -1,10 +1,10 @@
 {
   "name": "parcheh-pilot",
   "owner": {
-    "name": "Parcheh"
+    "name": "parcheh"
   },
   "metadata": {
-    "description": "Start, join and edit a shared Parcheh project."
+    "description": "Collaborate on one project from your own coding agent, with live edits and shared cursors."
   },
   "plugins": [
     {

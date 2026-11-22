@@ -9,7 +9,7 @@ export { diffTrees, materialize, scanTree } from './project-tree.mjs';
 
 const HEAD = 'refs/heads/room';
 const FORMAT = 1;
-const IDENTITY = 'Parcheh <room@parcheh.invalid>';
+const IDENTITY = 'parcheh <room@parcheh.invalid>';
 const queues = new Map();
 
 function atStore(storage, args, input, allowed) {
@@ -260,7 +260,7 @@ export async function openHistory(storage) {
   const target = await localPath(storage);
   const { bytes } = await atStore(target, ['rev-parse', '--is-bare-repository']);
   if (bytes.toString().trim() !== 'true' || !(await records(target)).length) {
-    throw fault('INVALID_HISTORY', 'The directory does not contain a Parcheh project history.');
+    throw fault('INVALID_HISTORY', 'The directory does not contain a parcheh project history.');
   }
   return history(target);
 }

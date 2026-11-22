@@ -3,7 +3,7 @@ set -eu
 umask 077
 plugin=${0%/*}
 digest=3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32
-cache="$HOME/Library/Caches/Parcheh/runtimes/$digest"
+cache="$HOME/Library/Caches/parcheh/runtimes/$digest"
 node="$cache/node"
 if [ ! -x "$node" ]; then
   /bin/mkdir -p "$cache"
@@ -13,7 +13,7 @@ if [ ! -x "$node" ]; then
   /usr/bin/gzip -dc "$plugin/runtime/node.gz" > "$unpacked"
   actual=$(/usr/bin/shasum -a 256 < "$unpacked")
   if [ "${actual%% *}" != "$digest" ]; then
-    echo "The bundled Parcheh runtime failed verification." >&2
+    echo "The bundled parcheh runtime failed verification." >&2
     exit 1
   fi
   /bin/chmod 700 "$unpacked"

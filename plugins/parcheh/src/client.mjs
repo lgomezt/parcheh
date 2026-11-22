@@ -37,7 +37,7 @@ function reachableUrl(input, allowLanHttp) {
   try {
     url = new URL(input);
   } catch {
-    throw new Error('Enter a complete Parcheh URL.');
+    throw new Error('Enter a complete parcheh URL.');
   }
   const hostname = url.hostname.replace(/^\[|\]$/g, '');
   const ip = isIP(hostname);
@@ -46,7 +46,7 @@ function reachableUrl(input, allowLanHttp) {
     (ip === 6 && /^f[cd]/.test(hostname));
   if (url.username || url.password ||
       (url.protocol !== 'https:' && !(url.protocol === 'http:' && (loopback || (allowLanHttp && lan))))) {
-    throw new Error('Parcheh requires HTTPS outside loopback unless private-LAN HTTP is explicitly enabled.');
+    throw new Error('parcheh requires HTTPS outside loopback unless private-LAN HTTP is explicitly enabled.');
   }
   return url;
 }
@@ -56,7 +56,7 @@ function parseInvite(input, allowLanHttp) {
   const [, prefix, room] = url.pathname.split('/');
   const secret = url.hash.slice(1);
   if (prefix !== 'r' || !uuid.test(room) || url.pathname !== '/r/' + room || url.search || !token.test(secret)) {
-    throw new Error('The Parcheh invitation must include its room ID and secret fragment.');
+    throw new Error('The parcheh invitation must include its room ID and secret fragment.');
   }
   return { room, origin: url.origin, inviteSecret: secret };
 }
@@ -75,14 +75,14 @@ async function rpc(origin, room, endpoint, memberToken, body) {
       signal: AbortSignal.timeout(endpoint === 'editing' ? 1500 : 15_000),
     });
   } catch {
-    throw new Error('Could not reach the Parcheh host. Check that the host and its connection are still open.');
+    throw new Error('Could not reach the parcheh host. Check that the host and its connection are still open.');
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
-    throw new Error('The Parcheh host rejected ' + endpoint + ' (HTTP ' + response.status + ').');
+    throw new Error('The parcheh host rejected ' + endpoint + ' (HTTP ' + response.status + ').');
   }
   return response.json().catch(() => {
-    throw new Error('The Parcheh host returned an unreadable ' + endpoint + ' response.');
+    throw new Error('The parcheh host returned an unreadable ' + endpoint + ' response.');
   });
 }
 
@@ -97,7 +97,7 @@ async function readJson(path) {
   try {
     return JSON.parse(data);
   } catch {
-    throw new Error('Could not read the private Parcheh state.');
+    throw new Error('Could not read the private parcheh state.');
   }
 }
 
@@ -113,18 +113,18 @@ async function writeJson(path, data) {
 
 function revision(result) {
   if (!result || !Number.isSafeInteger(result.rev) || result.rev < 1 || typeof result.oid !== 'string' || !result.oid) {
-    throw new Error('The Parcheh host returned an invalid revision.');
+    throw new Error('The parcheh host returned an invalid revision.');
   }
   return { rev: result.rev, oid: result.oid };
 }
 
 function binding(room, origin, result, allowLanHttp, browserOrigin = origin) {
   if (result.roomId !== room || !token.test(result.memberToken) || typeof result.browserUrl !== 'string') {
-    throw new Error('The Parcheh host returned an invalid room membership.');
+    throw new Error('The parcheh host returned an invalid room membership.');
   }
   const browser = reachableUrl(result.browserUrl, allowLanHttp);
   if (browser.origin !== browserOrigin || browser.pathname !== '/view/' + room || browser.search || !token.test(browser.hash.slice(1)) || browser.hash.slice(1) === result.memberToken) {
-    throw new Error('The Parcheh host returned an invalid browser link.');
+    throw new Error('The parcheh host returned an invalid browser link.');
   }
   return { room, origin, memberToken: result.memberToken, browserUrl: browser.href };
 }
@@ -166,7 +166,7 @@ async function chooseMacProject() {
   if (process.platform !== 'darwin') throw Error('Select a project using a coding app that supplies workspace access.');
   try {
     const {stdout} = await promisify(execFile)('/usr/bin/osascript', [
-      '-e', 'POSIX path of (choose folder with prompt "Choose the project to share in Parcheh")'
+      '-e', 'POSIX path of (choose folder with prompt "Choose the project to share in parcheh")'
     ], {timeout:120_000});
     return stdout.replace(/\r?\n$/, '');
   } catch { throw Error('Project selection was cancelled or unavailable.'); }
@@ -230,7 +230,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   } catch (error) {
     lock?.close();
     if (error.errcode !== 5) throw error;
-    throw new Error('Another Parcheh process is using the same PARCHEH_HOME.');
+    throw new Error('Another parcheh process is using the same PARCHEH_HOME.');
   }
   const allowLanHttp = env.PARCHEH_ALLOW_LAN_HTTP === '1';
   const statePath = (room) => join(home, 'room-' + room + '.json');
@@ -238,9 +238,9 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   const save = (state) => writeJson(statePath(state.room), state);
 
   async function load(room) {
-    if (!uuid.test(room)) throw new Error('Enter a Parcheh room ID.');
+    if (!uuid.test(room)) throw new Error('Enter a parcheh room ID.');
     const state = await readJson(statePath(room));
-    if (!state) throw new Error('This Parcheh process has no local binding for that room.');
+    if (!state) throw new Error('This parcheh process has no local binding for that room.');
     await checkSavedDirectory(state.folder, 'Room folder');
     reachableUrl(state.origin, allowLanHttp);
     return state;
@@ -272,7 +272,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     const remote = await rpc(state.origin, state.room, 'snapshot', state.memberToken);
     revision(remote);
     if (!isTree(remote.tree)) {
-      throw new Error('The Parcheh host returned an invalid project tree.');
+      throw new Error('The parcheh host returned an invalid project tree.');
     }
     return remote;
   }
@@ -283,7 +283,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       if (await realpath(state.accepted.path).catch(() => null) === state.accepted.path &&
           (await lstat(state.accepted.path)).isDirectory()) return;
     }
-    if (state.accepted && current.rev < state.accepted.rev) throw new Error('The Parcheh host returned an older revision.');
+    if (state.accepted && current.rev < state.accepted.rev) throw new Error('The parcheh host returned an older revision.');
     const path = await createCopy(state.folder, 'rev-' + current.rev + '-', remote.tree);
     state.accepted = { ...current, path, hasWebEntry: Object.hasOwn(remote.tree, 'index.html') };
     await save(state);
@@ -292,7 +292,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   async function install(state) {
     if (!state.scope) {
       const { tree } = await rpc(state.origin, state.room, 'scope', state.memberToken);
-      if (!isTree(tree)) throw new Error('The Parcheh host returned invalid project scope rules.');
+      if (!isTree(tree)) throw new Error('The parcheh host returned invalid project scope rules.');
       state.scope = tree;
     }
     await refresh(state, await snapshot(state));
@@ -426,7 +426,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
 
   async function begin_turn({ room }) {
     const state = await load(room);
-    if (state.closed) throw new Error('This Parcheh room is closed.');
+    if (state.closed) throw new Error('This parcheh room is closed.');
     if (!state.accepted) await install(state);
     if (!state.turn) {
       const latest = await snapshot(state);
@@ -447,7 +447,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
 
   async function finish_turn({ room }) {
     const state = await load(room);
-    if (state.closed) throw new Error('This Parcheh room is closed.');
+    if (state.closed) throw new Error('This parcheh room is closed.');
     if (!state.turn && !state.lastReceipt) throw new Error('Start a turn before finishing it.');
     if (state.turn) {
       const submissionPath = turnPath(state, 'submission');
@@ -577,7 +577,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
 
   async function end_room({ room }) {
     const state = await load(room);
-    if (!state.host) throw new Error('Only the host can end this Parcheh room.');
+    if (!state.host) throw new Error('Only the host can end this parcheh room.');
     if (!state.closed) {
       await rpc(state.origin, room, 'close', state.memberToken, {});
       state.closed = true;
