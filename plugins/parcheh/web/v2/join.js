@@ -38,10 +38,37 @@ function mount() {
   let selection;
   let preparedUrl;
   let interaction = 0;
+  let activeClaimToken = null;
+  let activeEmailParam = null;
   const handoffUnavailable = 'Choose an agent to join without connecting this tab.';
 
-  function buildJoinRequest() {
-    return 'Join this parcheh room: ' + (preparedUrl || link.href);
+  const room = /^\/r\/([a-f0-9-]+)$/.exec(link.pathname)?.[1];
+  let policy = { sharingMode: 'instant' };
+  async function fetchPolicy() {
+    try {
+      let res = await fetch('/v1/rooms/' + room + '/policy').catch(() => null);
+      if (!res || !res.ok) res = await fetch('/api/rooms/' + room + '/policy').catch(() => null);
+      if (res && res.ok) policy = await res.json().catch(() => ({ sharingMode: 'instant' }));
+    } catch {}
+    if (policy.sharingMode === 'email') {
+      const gate = element('email-gate');
+      if (gate) gate.hidden = false;
+    } else if (policy.sharingMode === 'restricted') {
+      const gate = element('email-gate');
+      if (gate) gate.hidden = false;
+      const label = document.querySelector('label[for="guest-email"]');
+      if (label) label.textContent = 'Enter your verified email';
+      const hint = element('email-hint');
+      if (hint) hint.textContent = policy.domainHint ? 'Requires verified ' + policy.domainHint + ' email' : 'Requires verified email';
+    }
+  }
+  fetchPolicy();
+
+  function buildJoinRequest(token, emailHint = activeEmailParam) {
+    let urlStr = preparedUrl || link.href;
+    if (token) urlStr += '&claim=' + token;
+    else if (emailHint) urlStr += '&email=' + encodeURIComponent(emailHint);
+    return 'Join this parcheh room: ' + urlStr;
   }
 
   function showPrompt(request) {
@@ -56,7 +83,44 @@ function mount() {
     status.textContent = '';
     prompt.hidden = true;
     manual.value = '';
-    const request = buildJoinRequest();
+
+    if (policy.sharingMode === 'email') {
+      const emailInput = element('guest-email');
+      const emailVal = emailInput?.value?.trim() || '';
+      if (!emailVal || !emailVal.includes('@')) {
+        const hint = element('email-hint');
+        if (hint) hint.textContent = 'Enter your email to join right away.';
+        emailInput?.focus();
+        for (const opt of choices) opt.setAttribute('aria-pressed', 'false');
+        return;
+      }
+      try {
+        let res = await fetch('/v1/auth/provisional', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email: emailVal }),
+        }).catch(() => null);
+        if (!res || !res.ok) {
+          res = await fetch('/api/auth/provisional', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ email: emailVal }),
+          }).catch(() => null);
+        }
+        if (res && res.ok) {
+          const prov = await res.json().catch(() => null);
+          if (prov?.claimToken) activeClaimToken = prov.claimToken;
+        }
+      } catch {}
+    } else if (policy.sharingMode === 'restricted') {
+      const emailVal = element('guest-email')?.value?.trim() || '';
+      activeEmailParam = emailVal.includes('@') ? emailVal : null;
+    } else if (policy.sharingMode === 'instant') {
+      const claimSection = element('claim-section');
+      if (claimSection) claimSection.hidden = false;
+    }
+
+    const request = buildJoinRequest(activeClaimToken);
     const client = clients[choice.dataset.client];
     if (client) {
       const compose = new URL(client.compose);
@@ -81,6 +145,37 @@ function mount() {
     }
   };
 
+  const claimInput = element('claim-email');
+  if (claimInput) {
+    claimInput.onchange = async () => {
+      const emailVal = claimInput.value.trim();
+      if (!emailVal || !emailVal.includes('@')) return;
+      try {
+        let res = await fetch('/v1/auth/claim-email', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email: emailVal }),
+        }).catch(() => null);
+        if (!res || !res.ok) {
+          res = await fetch('/api/rooms/' + room + '/claim-email', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ email: emailVal }),
+          }).catch(() => null);
+        }
+        if (res && res.ok) {
+          const claimed = await res.json().catch(() => null);
+          if (claimed?.claimToken) {
+            activeClaimToken = claimed.claimToken;
+            if (!prompt.hidden) showPrompt(buildJoinRequest(activeClaimToken));
+          }
+        }
+        const claimStatus = element('claim-status');
+        if (claimStatus) claimStatus.textContent = 'Email saved.';
+      } catch {}
+    };
+  }
+
   element('copy').onclick = async () => {
     const attempt = ++interaction;
     const copied = await copyText(manual.value);
@@ -102,7 +197,7 @@ function mount() {
     element('copy').disabled = waiting;
     if (state === 'unavailable' && !selection) status.textContent = handoffUnavailable;
     else if (url && status.textContent === handoffUnavailable) status.textContent = '';
-    if (!waiting && !prompt.hidden && selection === other) showPrompt(buildJoinRequest());
+    if (!waiting && !prompt.hidden && selection === other) showPrompt(buildJoinRequest(activeClaimToken));
   });
   element('flow').hidden = false;
   showPreview();
@@ -118,13 +213,57 @@ async function showPreview() {
     });
     const limit = 512 * 1024;
     const declaredLength = Number(response.headers.get('content-length'));
-    if (response.status !== 200 || response.headers.get('content-type') !== 'image/png' || declaredLength > limit) return;
-    const image = await response.blob();
-    if (image.size > limit) return;
+    if (response.status === 200 && response.headers.get('content-type') === 'image/png' && declaredLength <= limit) {
+      const image = await response.blob();
+      if (image.size <= limit) {
+        const preview = element('preview');
+        const previewUrl = URL.createObjectURL(image);
+        preview.onload = () => { preview.hidden = false; URL.revokeObjectURL(previewUrl); };
+        preview.onerror = () => URL.revokeObjectURL(previewUrl);
+        preview.src = previewUrl;
+        return;
+      }
+    }
+  } catch {}
+  try {
+    const response = await fetch('/v1/rooms/' + room + '/poster.enc', {
+      credentials: 'omit', cache: 'no-store', redirect: 'error',
+    });
+    if (response.status !== 200) return;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length < 28 || bytes.length > 512 * 1024 + 28) return;
+    const iv = bytes.slice(0, 12);
+    const ct = bytes.slice(12);
+    const baseKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(link.hash.slice(1)), 'HKDF', false, ['deriveKey']);
+    const posterKey = await crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: new TextEncoder().encode(room),
+        info: new TextEncoder().encode('parcheh-v1:poster'),
+      },
+      baseKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['decrypt']
+    );
+    const decrypted = await crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv,
+        additionalData: new TextEncoder().encode('parcheh-poster:' + room),
+      },
+      posterKey,
+      ct
+    );
+    const decBytes = new Uint8Array(decrypted);
+    const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    if (decBytes.length < 8 || decBytes.length > 512 * 1024 || !pngSignature.every((b, i) => decBytes[i] === b)) return;
+    const image = new Blob([decBytes], { type: 'image/png' });
     const preview = element('preview');
     const previewUrl = URL.createObjectURL(image);
     preview.onload = () => { preview.hidden = false; URL.revokeObjectURL(previewUrl); };
     preview.onerror = () => URL.revokeObjectURL(previewUrl);
     preview.src = previewUrl;
-  } catch { /* The invitation is usable without a preview. */ }
+  } catch {}
 }

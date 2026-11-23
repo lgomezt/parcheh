@@ -68,6 +68,12 @@
       padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px;
       font: inherit; color: inherit; background: #fffbf4;
     }
+    input[type="email"] {
+      width: 100%; display: block; margin-top: 6px; padding: 9px 11px;
+      border: 1px solid var(--border); border-radius: 8px;
+      font: inherit; color: inherit; background: #fffbf4;
+    }
+    :is(button, textarea, input):focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
     .action {
       display: block; width: 100%; margin-top: 8px; padding: 10px 14px;
       border: 0; border-radius: 8px; background: var(--blue); color: #fff; font: inherit; font-weight: 600;
@@ -92,6 +98,11 @@
       <p class="quiet" id="message"></p>
       <noscript>Open the invitation in a browser with JavaScript enabled.</noscript>
       <div id="flow" hidden>
+        <div id="email-gate" hidden style="margin-top: 14px; margin-bottom: 8px;">
+          <label for="guest-email" class="quiet">Enter your email to join right away</label>
+          <input type="email" id="guest-email" placeholder="you@example.com" autocomplete="email">
+          <p class="quiet" id="email-hint" style="margin-top: 4px; font-size: 12px;"></p>
+        </div>
         <div class="options" role="group" aria-label="Coding agents">
           <button class="option" type="button" disabled data-client="codex" aria-pressed="false">
             <svg class="mark" viewBox="0 0 28 28" aria-hidden="true">
@@ -129,6 +140,11 @@
           <p class="quiet">Paste this prompt into your coding agent.</p>
           <textarea id="manual" readonly aria-label="Join prompt"></textarea>
           <button class="action" id="copy" type="button">Copy prompt</button>
+        </div>
+        <div id="claim-section" hidden style="margin-top: 14px;">
+          <label for="claim-email" class="quiet">Save your edits to your email (optional)</label>
+          <input type="email" id="claim-email" placeholder="you@example.com" autocomplete="email">
+          <p id="claim-status" class="quiet" style="margin-top: 4px; font-size: 12px;"></p>
         </div>
         <div class="feedback quiet">
           <p class="guidance">After you join, this tab will show the shared project.</p>

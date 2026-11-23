@@ -8,7 +8,8 @@
       ],
       "env": {
         "PARCHEH_DESKTOP": "1",
-        "PARCHEH_ALLOW_LAN_HTTP": "1"
+        "PARCHEH_ALLOW_LAN_HTTP": "1",
+        "PARCHEH_RELAY_ORIGIN": "https://parcheh.augi.ca"
       }
     }
   }

@@ -206,6 +206,7 @@ function overlay(base, head, changes) {
 
 function history(storage) {
   return {
+    storage,
     async head(rev) {
       const revisions = await records(storage);
       const entry = rev === undefined ? revisions.at(-1) : revisions[rev - 1];

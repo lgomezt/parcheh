@@ -2,6 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { openClient } from './client.mjs';
+import { connectHelper } from './helper.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 
 const path = { type: 'string', minLength: 1 };
@@ -25,13 +26,23 @@ const tools = [
   {
     name: 'start_room',
     description: 'Share a selected project directory in a new parcheh room. Returns the invitation, browser link and local accepted workspace.',
-    properties: { continueFromRoom: {type:"string", description:"Explicitly fork a previous room hosted here. Use for older saved rooms with a verified local host history or to select an earlier branch."}, source: path, workspaceParent: path, displayName: name, ...browserOptions },
+    properties: {
+      continueFromRoom: {type:"string", description:"Explicitly fork a previous room hosted here. Use for older saved rooms with a verified local host history or to select an earlier branch."},
+      source: path,
+      workspaceParent: path,
+      displayName: name,
+      sharingMode: { type: 'string', description: 'Progressive sharing policy: instant (zero friction, default), email (provisional unverified), or restricted (verified email required).' },
+      allowedEmails: { type: 'string', description: 'Comma-separated list of allowed email addresses for restricted rooms.' },
+      allowedDomain: { type: 'string', description: 'Allowed email domain (e.g. uwaterloo.ca or @uwaterloo.ca) for restricted rooms.' },
+      allowGuestInvite: { type: 'boolean', description: 'Allow guests to copy and re-share the room invitation from their browser preview. Defaults to true (false for restricted).' },
+      ...browserOptions,
+    },
     required: process.env.PARCHEH_DESKTOP === '1' ? [] : ['source'],
   },
   {
     name: 'join_room',
     description: 'Join a parcheh room from a participant invitation and download its accepted project to a local workspace.',
-    properties: { inviteUrl: { type: 'string', format: 'uri' }, workspaceParent: path, displayName: name, ...browserOptions },
+    properties: { inviteUrl: { type: 'string', format: 'uri' }, workspaceParent: path, displayName: name, email: { type: 'string', description: 'Email address for email-gated or restricted rooms.' }, ...browserOptions },
     required: ['inviteUrl'],
   },
   {
@@ -75,6 +86,48 @@ const tools = [
     description: 'End the shared room if you are its host. Preserve the local source copies and unfinished draft.',
     properties: { room },
     required: ['room'],
+  },
+  {
+    name: 'leave_room',
+    description: 'Leave the shared room if you are a guest participant. Preserves the local accepted workspace and draft.',
+    properties: { room },
+    required: ['room'],
+  },
+  {
+    name: 'revoke_member',
+    description: 'Revoke a participant’s access to the shared room if you are its host.',
+    properties: { room, member: name },
+    required: ['room', 'member'],
+  },
+  {
+    name: 'revoke_invite',
+    description: 'Revoke the active invitation link for this room if you are its host.',
+    properties: { room },
+    required: ['room'],
+  },
+  {
+    name: 'new_invite',
+    description: 'Create a fresh invitation link for this room if you are its host.',
+    properties: {
+      room,
+      sharingMode: { type: 'string', description: 'Update room sharing policy: instant, email, or restricted.' },
+      allowedEmails: { type: 'string', description: 'Comma-separated allowed email addresses for restricted sharing.' },
+      allowedDomain: { type: 'string', description: 'Allowed email domain (e.g. uwaterloo.ca or @uwaterloo.ca) for restricted sharing.' },
+      allowGuestInvite: { type: 'boolean', description: 'Allow guests to copy and re-share the room invitation.' },
+    },
+    required: ['room'],
+  },
+  {
+    name: 'verify_email',
+    description: 'Verify your email address once and bind it cryptographically to this Mac device key for restricted rooms.',
+    properties: {
+      email: { type: 'string', description: 'Email address to verify.' },
+      code: { type: 'string', description: '6-digit verification code received by email.' },
+      challengeToken: { type: 'string', description: 'Stateless challenge token from the code request step.' },
+      origin: { type: 'string', description: 'Relay or host origin address.' },
+      inviteUrl: { type: 'string', format: 'uri', description: 'Invitation URL to infer origin from.' },
+    },
+    required: ['email'],
   },
 ];
 const toolList = tools.map(({ name, description, properties, required }) => ({
@@ -153,7 +206,13 @@ async function handle(message) {
       }
       try {
         const args = checkedArguments(methods.get(params.name), params.arguments ?? {});
-        client ??= await openClient(process.env, {getRoots});
+        if (!client) {
+          if (process.env.PARCHEH_DESKTOP === '1' || process.env.PARCHEH_USE_HELPER === '1') {
+            client = await connectHelper({ env: process.env, getRoots });
+          } else {
+            client = await openClient(process.env, { getRoots });
+          }
+        }
         const token = params._meta?.progressToken;
         function progress(value, message) {
           if (typeof token === 'string' || Number.isFinite(token)) {

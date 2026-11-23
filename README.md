@@ -16,7 +16,7 @@ Start with a new project or one you already have. Share one link, ask your own a
 
 ## Installation
 
-These instructions are for Apple silicon Macs. For the current pilot, connect to the same Wi-Fi as the host.
+These instructions are for Apple silicon Macs. Collaborators can join across different networks.
 
 ### Codex and Claude Code
 
@@ -41,6 +41,6 @@ Use a local coding tool that supports MCP servers over standard input and output
 
 - **Command** `/bin/sh`
 - **Argument** The full path to `plugins/parcheh/launch-mcp.sh` in the extracted folder
-- **Environment variables** `PARCHEH_DESKTOP=1` and `PARCHEH_ALLOW_LAN_HTTP=1`
+- **Environment variables** `PARCHEH_DESKTOP=1`, `PARCHEH_ALLOW_LAN_HTTP=1`, and `PARCHEH_RELAY_ORIGIN=https://parcheh.augi.ca`
 
 Open the invitation, choose **Other**, and paste the prepared prompt into your coding chat.

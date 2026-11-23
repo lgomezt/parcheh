@@ -7,9 +7,12 @@ import { isIP } from 'node:net';
 import { homedir, networkInterfaces, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { loadOrCreateDeviceIdentity, saveDeviceCertificate, loadDeviceCertificates } from './device-identity.mjs';
 import { checkSourceRoot } from './project-tree.mjs';
 import { draftFiles } from './desktop-draft.mjs';
 import { invalidDisplayName, normalizeDisplayName } from './display-name.mjs';
+import { encryptTabHandoff } from './relay-crypto.mjs';
+import { startLocalPreviewServer } from './local-preview.mjs';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const token = /^[A-Za-z0-9_-]{16,256}$/;
@@ -70,16 +73,62 @@ function reachableUrl(input, allowLanHttp) {
 function parseInvite(input, allowLanHttp) {
   const url = reachableUrl(input, allowLanHttp);
   const [, prefix, room] = url.pathname.split('/');
-  const [secret, suffix, ...extra] = url.hash.slice(1).split('&');
-  const handoff = suffix?.match(/^handoff=([0-9a-f]{48})$/)?.[1];
-  if (extra.length || (suffix !== undefined && !handoff)) throw Error('Invalid invitation tab handoff.');
+  const hashParts = url.hash.slice(1).split('&');
+  const secret = hashParts[0];
+  const params = hashParts.slice(1);
+  let handoff;
+  let claim;
+  let email;
+  const seenKeys = new Set();
+  for (const part of params) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) throw new Error('Invalid invitation tab handoff.');
+    const key = part.slice(0, eqIdx);
+    const value = part.slice(eqIdx + 1);
+    if (seenKeys.has(key)) throw new Error('Invalid invitation tab handoff.');
+    seenKeys.add(key);
+    if (key === 'handoff') {
+      if (!/^[0-9a-f]{64}$/.test(value)) throw new Error('Invalid invitation tab handoff.');
+      handoff = value;
+    } else if (key === 'claim') {
+      if (!/^[A-Za-z0-9._-]{16,2048}$/.test(value)) throw new Error('Invalid invitation tab handoff.');
+      claim = value;
+    } else if (key === 'email') {
+      try {
+        email = decodeURIComponent(value);
+      } catch {
+        throw new Error('Invalid invitation tab handoff.');
+      }
+      if (!email || !email.includes('@')) throw new Error('Invalid invitation tab handoff.');
+    } else {
+      throw new Error('Invalid invitation tab handoff.');
+    }
+  }
   if (prefix !== 'r' || !uuid.test(room) || url.pathname !== '/r/' + room || url.search || !token.test(secret)) {
     throw new Error('The parcheh invitation must include its room ID and secret fragment.');
   }
-  return { room, origin: url.origin, inviteSecret: secret, handoff };
+  return { room, origin: url.origin, inviteSecret: secret, handoff, claim, email };
+}
+
+const guestRelaysByToken = new Map();
+const guestRelaysByRoom = new Map();
+const activePreviewServers = new Map();
+
+async function isRelayOrigin(origin) {
+  try {
+    const res = await fetch(origin + '/healthz', { signal: AbortSignal.timeout(1500) });
+    if (res.ok) {
+      const json = await res.json().catch(() => null);
+      if (json?.service === 'parcheh-relay') return true;
+    }
+  } catch {}
+  return false;
 }
 
 async function rpc(origin, room, endpoint, memberToken, body) {
+  if (memberToken && guestRelaysByToken.has(memberToken)) {
+    return guestRelaysByToken.get(memberToken).rpc(endpoint, memberToken, body);
+  }
   const headers = { accept: 'application/json' };
   if (memberToken) headers.authorization = 'Bearer ' + memberToken;
   if (body) headers['content-type'] = 'application/json';
@@ -96,8 +145,14 @@ async function rpc(origin, room, endpoint, memberToken, body) {
     throw new Error('Could not reach the parcheh host. Check that the host and its connection are still open.');
   }
   if (!response.ok) {
+    let errMessage = null;
+    try {
+      const errJson = await response.json();
+      if (errJson?.error) errMessage = errJson.error;
+    } catch {}
     await response.body?.cancel().catch(() => {});
-    throw new Error('The parcheh host rejected ' + endpoint + ' (HTTP ' + response.status + ').');
+    const baseMsg = errMessage ? `${errMessage} (HTTP ${response.status}).` : 'The parcheh host rejected ' + endpoint + ' (HTTP ' + response.status + ').';
+    throw new Error(baseMsg);
   }
   return response.json().catch(() => {
     throw new Error('The parcheh host returned an unreadable ' + endpoint + ' response.');
@@ -136,12 +191,15 @@ function revision(result) {
   return { rev: result.rev, oid: result.oid };
 }
 
-function binding(room, origin, result, allowLanHttp, browserOrigin = origin) {
+function binding(room, origin, result, allowLanHttp, browserOrigin = origin, transport = 'direct') {
   if (result.roomId !== room || !token.test(result.memberToken) || typeof result.browserUrl !== 'string') {
     throw new Error('The parcheh host returned an invalid room membership.');
   }
   const browser = reachableUrl(result.browserUrl, allowLanHttp);
-  if (browser.origin !== browserOrigin || browser.pathname !== '/view/' + room || browser.search || !token.test(browser.hash.slice(1)) || browser.hash.slice(1) === result.memberToken) {
+  const allowedOrigin = transport === 'relay'
+    ? (['127.0.0.1', 'localhost'].includes(browser.hostname))
+    : browser.origin === browserOrigin;
+  if (!allowedOrigin || browser.pathname !== '/view/' + room || browser.search || !token.test(browser.hash.slice(1)) || browser.hash.slice(1) === result.memberToken) {
     throw new Error('The parcheh host returned an invalid browser link.');
   }
   return { room, origin, memberToken: result.memberToken, browserUrl: browser.href };
@@ -203,6 +261,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   }
   const home = await realpath(privatePath);
   if (root && inside(home, root)) throw new Error('The authorized workspace must be outside PARCHEH_HOME.');
+  const deviceIdentity = await loadOrCreateDeviceIdentity(home, { useKeychain: env.PARCHEH_KEYCHAIN === '1' });
   const lock = desktop ? null : new DatabaseSync(join(home, 'client-lock.sqlite'));
   let managed;
   if (desktop) {
@@ -256,12 +315,66 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   const liveTreePath = (state) => join(home, 'room-' + state.room + '-live.json');
   const save = (state) => writeJson(statePath(state.room), state);
 
+  async function getGuestRelay(state) {
+    const key = `${home}:${state.room}`;
+    let gr = guestRelaysByRoom.get(key);
+    if (!gr) {
+      const { connectGuestRelay } = await import('./relay-transport.mjs');
+      const identity = await loadOrCreateDeviceIdentity(home);
+      gr = await connectGuestRelay({
+        relayOrigin: state.origin,
+        roomId: state.room,
+        inviteSecret: state.inviteSecret,
+        rejoinMemberId: state.memberId,
+        reconnectSecret: state.reconnectSecret,
+        deviceIdentity: identity,
+        onRevisionBroadcast: async (revMsg) => {
+          try {
+            if (!state.folder) return;
+            const gitDir = join(state.folder, 'git');
+            const { importQuarantinedPack } = await import('./git-pack.mjs');
+            const packBuf = Buffer.from(revMsg.packB64, 'base64');
+            const tree = await importQuarantinedPack(gitDir, packBuf, revMsg.oid);
+            await refresh(state, { rev: revMsg.rev, oid: revMsg.oid, tree });
+          } catch {}
+        },
+      });
+      const currentGr = gr;
+      gr.onClose(() => {
+        if (guestRelaysByRoom.get(key) === currentGr) guestRelaysByRoom.delete(key);
+        if (state.memberToken && guestRelaysByToken.get(state.memberToken) === currentGr) {
+          guestRelaysByToken.delete(state.memberToken);
+        }
+      });
+      guestRelaysByRoom.set(key, gr);
+      if (state.memberToken) {
+        guestRelaysByToken.set(state.memberToken, gr);
+      }
+    }
+    return gr;
+  }
+
   async function load(room) {
     if (!uuid.test(room)) throw new Error('Enter a parcheh room ID.');
     const state = await readJson(statePath(room));
     if (!state) throw new Error('This parcheh process has no local binding for that room.');
     await checkSavedDirectory(state.folder, 'Room folder');
     reachableUrl(state.origin, allowLanHttp);
+    if (state.transport === 'relay' && !state.closed) {
+      const gr = await getGuestRelay(state).catch(() => null);
+      if (gr && state.hostBrowserToken && !activePreviewServers.has(`${home}:${state.room}`)) {
+        const previewServer = await startLocalPreviewServer({
+          roomId: state.room,
+          hostBrowserToken: state.hostBrowserToken,
+          getTree: () => readJson(liveTreePath(state)),
+          getRev: () => state.accepted?.rev ?? 0,
+          guestRelay: gr,
+          localAppUrl: state.localAppUrl,
+        });
+        activePreviewServers.set(`${home}:${state.room}`, previewServer);
+        state.browserUrl = previewServer.browserUrl;
+      }
+    }
     return state;
   }
 
@@ -288,6 +401,20 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   }
 
   async function snapshot(state) {
+    if (!process.env.PARCHEH_LEGACY_SNAPSHOT) {
+      try {
+        const haveOids = state.accepted?.oid ? [state.accepted.oid] : [];
+        const packRes = await rpc(state.origin, state.room, 'pack', state.memberToken, { haveOids });
+        if (packRes?.oid && packRes?.packBase64) {
+          revision(packRes);
+          const packBuf = Buffer.from(packRes.packBase64, 'base64');
+          const gitDir = join(state.folder, 'git');
+          const { importQuarantinedPack } = await import('./git-pack.mjs');
+          const tree = await importQuarantinedPack(gitDir, packBuf, packRes.oid);
+          return { rev: packRes.rev, oid: packRes.oid, tree };
+        }
+      } catch (err) {}
+    }
     const remote = await rpc(state.origin, state.room, 'snapshot', state.memberToken);
     revision(remote);
     if (!isTree(remote.tree)) {
@@ -453,7 +580,13 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return local;
   }
 
-  async function start_room({ source, continueFromRoom, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
+  async function start_room({ source, continueFromRoom, workspaceParent, displayName, pointers, actions, openPreview, allowGuestInvite, sharingMode, allowedEmails, allowedDomain }, progress = () => {}) {
+    if (sharingMode !== undefined && !['instant', 'email', 'restricted'].includes(sharingMode)) {
+      throw new Error("sharingMode must be 'instant', 'email', or 'restricted'.");
+    }
+    if (sharingMode === 'restricted' && !allowedEmails && !allowedDomain) {
+      throw new Error('Restricted rooms require allowedEmails or allowedDomain.');
+    }
     const name = entryDisplayName(displayName);
     const selected = await chooseSource(source);
     if (inside(selected, home) || inside(home, selected)) throw new Error('The source must exclude PARCHEH_HOME.');
@@ -475,7 +608,14 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     const { launchHost: startHost } = await import('./room-process.mjs');
     const launch = () => startHost({
       source: selected, continuityHome:home, continueFromRoom, deferPublish:true, displayName: name, storage: join(home, 'host-' + randomUUID()), bind, port, publicOrigin,
-      releaseDirectory: env.PARCHEH_RELEASE_DIR || fileURLToPath(new URL('../dist/desktop/', import.meta.url)),
+      relayOrigin: env.PARCHEH_PUBLIC_ORIGIN === '' ? undefined : (env.PARCHEH_RELAY_ORIGIN || undefined),
+      allowGuestInvite,
+      sharingMode: sharingMode || 'instant',
+      allowedEmails: allowedEmails || null,
+      allowedDomain: allowedDomain || null,
+      trustedAuthPublicKeys: env.PARCHEH_TRUSTED_AUTH_PUBKEY
+        ? env.PARCHEH_TRUSTED_AUTH_PUBKEY.split(',').map(s => s.trim()).filter(Boolean)
+        : undefined,
     });
     let host;
     try { host = await launch(); } catch (error) {
@@ -540,13 +680,79 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     }
   }
 
-  async function join_room({ inviteUrl, workspaceParent, displayName, pointers, actions, openPreview }, progress = () => {}) {
+  async function join_room({ inviteUrl, workspaceParent, displayName, pointers, actions, openPreview, email }, progress = () => {}) {
     const name = entryDisplayName(displayName);
-    const { room, origin, inviteSecret, handoff } = parseInvite(inviteUrl, allowLanHttp);
+    const { room, origin, inviteSecret, handoff, claim, email: urlEmail } = parseInvite(inviteUrl, allowLanHttp);
+    let claimToken = claim;
+    let guestEmail = email || urlEmail;
+    let deviceCert = null;
+
+    const certs = await loadDeviceCertificates(home, { useKeychain: env.PARCHEH_KEYCHAIN === '1' }).catch(() => []);
+    if (guestEmail) {
+      const match = certs.find(c => c.origin === origin && c.email.toLowerCase() === guestEmail.toLowerCase());
+      if (match) deviceCert = match.certificate;
+    }
+    if (!deviceCert) {
+      const match = certs.find(c => c.origin === origin);
+      if (match) {
+        deviceCert = match.certificate;
+        if (!guestEmail) guestEmail = match.email;
+      }
+    }
+
+    if (!claimToken && !deviceCert && guestEmail) {
+      try {
+        const provRes = await fetch(origin + '/v1/auth/provisional', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email: guestEmail }),
+          signal: AbortSignal.timeout(3000),
+        }).catch(() => null);
+        if (provRes && provRes.ok) {
+          const json = await provRes.json().catch(() => null);
+          if (json?.claimToken) claimToken = json.claimToken;
+        } else {
+          const hRes = await fetch(origin + '/api/auth/provisional', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ email: guestEmail }),
+            signal: AbortSignal.timeout(3000),
+          }).catch(() => null);
+          if (hRes && hRes.ok) {
+            const json = await hRes.json().catch(() => null);
+            if (json?.claimToken) claimToken = json.claimToken;
+          }
+        }
+      } catch {}
+    }
     async function finishJoin(state, result) {
       if (!handoff) return readyView(state,result,openPreview,progress);
       const app = state.localAppUrl ? localAppAddress(state.localAppUrl) : null;
-      await rpc(origin,room,'tab-confirm',state.memberToken,{id:handoff,inviteSecret,...(app && {app})});
+      const browserToken = new URL(state.browserUrl).hash.slice(1);
+      const payload = {
+        redirectUrl: state.browserUrl,
+        browserToken,
+        ...(app && { app }),
+      };
+      const enc = encryptTabHandoff(handoff, room, payload);
+      if (state.transport === 'relay') {
+        const res = await fetch(`${origin}/v1/rooms/${room}/handoffs/${handoff}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: enc,
+        });
+        if (!res.ok) throw new Error(`Failed to deliver tab handoff to relay (HTTP ${res.status}).`);
+      } else {
+        const res = await fetch(`${origin}/api/rooms/${room}/handoffs/${handoff}`, {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${state.memberToken}`,
+            'content-type': 'application/octet-stream',
+          },
+          body: enc,
+        });
+        if (!res.ok) throw new Error(`Failed to deliver tab handoff to host (HTTP ${res.status}).`);
+      }
       progress(100,'Ready in the invitation tab');
       return {...result, browserUrl:null, browserHandoff:'invitation-tab'};
     }
@@ -575,12 +781,55 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     if (pointers !== undefined) pending.sharing.pointers = pointers;
     if (actions !== undefined) pending.sharing.actions = actions;
     await writeJson(pendingPath, pending);
+
+    let guestRelay = null;
+    let activeState = null;
+    if (await isRelayOrigin(origin)) {
+      const { connectGuestRelay } = await import('./relay-transport.mjs');
+      const identity = await loadOrCreateDeviceIdentity(home);
+      guestRelay = await connectGuestRelay({
+        relayOrigin: origin,
+        roomId: room,
+        inviteSecret,
+        deviceIdentity: identity,
+        onRevisionBroadcast: async (revMsg) => {
+          try {
+            if (!activeState?.folder) return;
+            const gitDir = join(activeState.folder, 'git');
+            const { importQuarantinedPack } = await import('./git-pack.mjs');
+            const packBuf = Buffer.from(revMsg.packB64, 'base64');
+            const tree = await importQuarantinedPack(gitDir, packBuf, revMsg.oid);
+            await refresh(activeState, { rev: revMsg.rev, oid: revMsg.oid, tree });
+          } catch {}
+        },
+      });
+      guestRelaysByRoom.set(`${home}:${room}`, guestRelay);
+    }
+
     async function admit() {
-      // v1 hosts do not understand requestId. Only retry an ambiguous delivery on v2.
-      const request = { inviteSecret, displayName:pending.displayName, requestId:pending.requestId, ...(handoff && {handoff}) };
+      const identity = await loadOrCreateDeviceIdentity(home, { useKeychain: env.PARCHEH_KEYCHAIN === '1' });
+      const { signDevicePayload } = await import('./device-identity.mjs');
+      const joinProofNonce = randomUUID();
+      const signBuf = Buffer.from(`${room}:${pending.requestId || ''}:${joinProofNonce}`, 'utf8');
+      const joinProofSigHex = signDevicePayload(identity, signBuf).toString('hex');
+
+      const request = {
+        inviteSecret,
+        displayName: pending.displayName,
+        requestId: pending.requestId,
+        ...(handoff && { handoff }),
+        ...(claimToken && { claimToken }),
+        ...(deviceCert && { deviceCertificate: deviceCert }),
+        guestEdPubHex: identity.publicKeyHex,
+        joinProofNonce,
+        joinProofSigHex,
+      };
+      if (guestRelay) {
+        return guestRelay.rpc('join', undefined, request);
+      }
       try { return await rpc(origin, room, 'join', undefined, request); }
       catch (error) {
-        if (!handoff && error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName:pending.displayName });
+        if (!handoff && error.message.includes('(HTTP 400)')) return rpc(origin, room, 'join', undefined, { inviteSecret, displayName: pending.displayName });
         if (error.message.startsWith('Could not reach')) return rpc(origin, room, 'join', undefined, request);
         throw error;
       }
@@ -589,7 +838,35 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       if (error.message.includes('(HTTP 4')) await rm(pendingPath,{force:true});
       throw error;
     });
-    const state = binding(room, origin, member, allowLanHttp);
+    if (guestRelay && member.memberToken) {
+      const key = `${home}:${room}`;
+      const currentGr = guestRelay;
+      guestRelay.onClose(() => {
+        if (guestRelaysByRoom.get(key) === currentGr) guestRelaysByRoom.delete(key);
+        if (guestRelaysByToken.get(member.memberToken) === currentGr) {
+          guestRelaysByToken.delete(member.memberToken);
+        }
+      });
+      guestRelaysByToken.set(member.memberToken, guestRelay);
+    }
+    const state = binding(room, origin, member, allowLanHttp, origin, guestRelay ? 'relay' : 'direct');
+    if (guestRelay) {
+      state.transport = 'relay';
+      state.memberId = member.memberId;
+      state.reconnectSecret = member.reconnectSecret;
+      state.hostBrowserToken = new URL(member.browserUrl).hash.slice(1);
+      const previewServer = await startLocalPreviewServer({
+        roomId: room,
+        hostBrowserToken: state.hostBrowserToken,
+        getTree: () => readJson(liveTreePath(state)),
+        getRev: () => state.accepted?.rev ?? 0,
+        guestRelay,
+        localAppUrl: state.localAppUrl,
+      });
+      activePreviewServers.set(`${home}:${room}`, previewServer);
+      state.browserUrl = previewServer.browserUrl;
+      activeState = state;
+    }
     // Set fresh enrollment defaults before saving or exposing the browser URL. The
     // outstanding join receipt lets a retry recover this member on a 0.2.x host.
     const { sharing } = await browserSettings(state, pending.sharing, true);
@@ -740,7 +1017,15 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       Object.assign(result, {
         ...(state.turn && revision(remote)),
         sharing,
-        members: members.map(({ id, name }) => ({ id, name })),
+        members: members.map(({ id, name, email, emailVerified, emailStatus }) => ({
+          id,
+          name,
+          ...(email && {
+            email,
+            emailVerified: Boolean(emailVerified),
+            emailStatus: emailVerified ? 'verified' : (emailStatus || 'unverified'),
+          }),
+        })),
       });
     }
     if (state.turn) {
@@ -780,6 +1065,193 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     };
   }
 
+  async function leave_room({ room }) {
+    const state = await load(room);
+    if (state.host) throw new Error('Only guests can leave a parcheh room. Use end_room if you are the host.');
+    if (!state.closed) {
+      try {
+        await rpc(state.origin, room, 'leave', state.memberToken, {});
+      } catch {}
+      const activeTimer = editingTimers.get(room);
+      if (activeTimer) {
+        clearInterval(activeTimer.timer);
+        activeTimer.stop().catch(() => {});
+        editingTimers.delete(room);
+      }
+      state.closed = true;
+      state.left = true;
+      await save(state);
+    }
+    const key = `${home}:${room}`;
+    const ps = activePreviewServers.get(key);
+    if (ps) {
+      ps.close();
+      activePreviewServers.delete(key);
+    }
+    const gr = guestRelaysByRoom.get(key);
+    if (gr) {
+      gr.close();
+      guestRelaysByRoom.delete(key);
+      if (state.memberToken) guestRelaysByToken.delete(state.memberToken);
+    }
+    return { ...workspaceInfo(state), outcome: 'left', ...(state.turn && { draftWorkspace: state.turn.path }) };
+  }
+
+  async function revoke_member({ room, member }) {
+    const state = await load(room);
+    if (!state.host) throw new Error('Only the host can revoke a participant.');
+    const res = await rpc(state.origin, room, 'revoke-member', state.memberToken, { member });
+    return { room, ...res };
+  }
+
+  async function revoke_invite({ room }) {
+    const state = await load(room);
+    if (!state.host) throw new Error('Only the host can revoke an invitation.');
+    await rpc(state.origin, room, 'revoke-invite', state.memberToken, {});
+    return { room, inviteRevoked: true };
+  }
+
+  async function new_invite({ room, sharingMode, allowedEmails, allowedDomain, allowGuestInvite }) {
+    const state = await load(room);
+    if (!state.host) throw new Error('Only the host can create a new invitation.');
+    const res = await rpc(state.origin, room, 'new-invite', state.memberToken, {
+      ...(sharingMode && { sharingMode }),
+      ...(allowedEmails !== undefined && { allowedEmails }),
+      ...(allowedDomain !== undefined && { allowedDomain }),
+      ...(allowGuestInvite !== undefined && { allowGuestInvite }),
+    });
+    parseInvite(res.inviteUrl, allowLanHttp);
+    return { room, inviteUrl: res.inviteUrl };
+  }
+
+  async function verify_email({ email, code, challengeToken, origin, inviteUrl }) {
+    if (!email || typeof email !== 'string') throw new Error('email must be a valid string.');
+    const normEmail = email.trim().toLowerCase();
+
+    let targetOrigin = null;
+    if (origin) {
+      targetOrigin = reachableUrl(origin, allowLanHttp).origin;
+    } else if (inviteUrl) {
+      targetOrigin = reachableUrl(inviteUrl, allowLanHttp).origin;
+    } else {
+      targetOrigin = env.PARCHEH_RELAY_ORIGIN || 'https://parcheh.augi.ca';
+    }
+    targetOrigin = targetOrigin.replace(/\/+$/, '');
+
+    const identity = await loadOrCreateDeviceIdentity(home, { useKeychain: env.PARCHEH_KEYCHAIN === '1' });
+    const pendingVerifyPath = join(home, 'pending-verify.json');
+
+    if (!code) {
+      let res;
+      try {
+        res = await fetch(`${targetOrigin}/v1/auth/request-verify`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email: normEmail, devicePublicKeyHex: identity.publicKeyHex }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (res.status === 404) {
+          res = await fetch(`${targetOrigin}/api/auth/request-verify`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ email: normEmail, devicePublicKeyHex: identity.publicKeyHex }),
+            signal: AbortSignal.timeout(10_000),
+          });
+        }
+      } catch {
+        throw new Error(`Could not reach authentication server at ${targetOrigin}.`);
+      }
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        throw new Error(errBody?.error || `Request verify failed with HTTP ${res.status}.`);
+      }
+
+      const data = await res.json();
+      const tokenToSave = data.challengeToken;
+      const record = {
+        email: normEmail,
+        challengeToken: tokenToSave,
+        origin: targetOrigin,
+        expiresAt: data.expiresAt,
+      };
+      const staged = pendingVerifyPath + '.' + randomUUID() + '.tmp';
+      try {
+        await writeFile(staged, JSON.stringify(record, null, 2), { flag: 'wx', mode: 0o600, flush: true });
+        await rename(staged, pendingVerifyPath);
+      } finally {
+        await rm(staged, { force: true }).catch(() => {});
+      }
+      return { status: 'code_sent', email: normEmail, origin: targetOrigin };
+    }
+
+    let tokenToUse = challengeToken;
+    if (!tokenToUse) {
+      try {
+        const raw = await readFile(pendingVerifyPath, 'utf8');
+        const saved = JSON.parse(raw);
+        if (saved.email === normEmail) {
+          tokenToUse = saved.challengeToken;
+          if (!origin && !inviteUrl && saved.origin) targetOrigin = saved.origin;
+        }
+      } catch {}
+    }
+    if (!tokenToUse) {
+      throw new Error('No pending challenge token found. Call verify_email with your email first.');
+    }
+
+    const { signDevicePayload } = await import('./device-identity.mjs');
+    const proofPayload = Buffer.from('parcheh-verify:' + normEmail + ':' + String(code).trim() + ':' + tokenToUse, 'utf8');
+    const proofSigHex = signDevicePayload(identity, proofPayload).toString('hex');
+
+    let res;
+    try {
+      res = await fetch(`${targetOrigin}/v1/auth/complete-verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          email: normEmail,
+          code: String(code).trim(),
+          challengeToken: tokenToUse,
+          devicePublicKeyHex: identity.publicKeyHex,
+          proofSigHex,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status === 404) {
+        res = await fetch(`${targetOrigin}/api/auth/complete-verify`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            email: normEmail,
+            code: String(code).trim(),
+            challengeToken: tokenToUse,
+            devicePublicKeyHex: identity.publicKeyHex,
+            proofSigHex,
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+      }
+    } catch {
+      throw new Error(`Could not reach authentication server at ${targetOrigin}.`);
+    }
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => null);
+      throw new Error(errBody?.error || `Complete verify failed with HTTP ${res.status}.`);
+    }
+
+    const data = await res.json();
+    await saveDeviceCertificate(home, {
+      origin: targetOrigin,
+      email: normEmail,
+      certificate: data.deviceCertificate,
+    }, { useKeychain: env.PARCHEH_KEYCHAIN === '1' });
+    await rm(pendingVerifyPath, { force: true }).catch(() => {});
+
+    return { status: 'verified', email: normEmail, devicePublicKeyHex: identity.publicKeyHex };
+  }
+
   async function end_room({ room }) {
     const state = await load(room);
     if (!state.host) throw new Error('Only the host can end this parcheh room.');
@@ -787,6 +1259,18 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       await rpc(state.origin, room, 'close', state.memberToken, {});
       state.closed = true;
       await save(state);
+    }
+    const key = `${home}:${room}`;
+    const ps = activePreviewServers.get(key);
+    if (ps) {
+      ps.close();
+      activePreviewServers.delete(key);
+    }
+    const gr = guestRelaysByRoom.get(key);
+    if (gr) {
+      gr.close();
+      guestRelaysByRoom.delete(key);
+      if (state.memberToken) guestRelaysByToken.delete(state.memberToken);
     }
     return { ...workspaceInfo(state), outcome: 'closed', ...(state.turn && { draftWorkspace: state.turn.path }) };
   }
@@ -800,19 +1284,36 @@ export async function openClient(env = process.env, { getRoots = async () => [],
 
   const draftLocks = new Map();
   function releaseDraft(room) {
-    draftLocks.get(room)?.close();
+    const edit = draftLocks.get(room);
+    if (edit?.isOpen) edit.close();
     draftLocks.delete(room);
   }
   async function close() {
-    lock?.close();
+    if (lock?.isOpen) lock.close();
     for (const room of draftLocks.keys()) releaseDraft(room);
+    for (const [key, ps] of activePreviewServers) {
+      if (key.startsWith(`${home}:`)) {
+        ps.close();
+        activePreviewServers.delete(key);
+      }
+    }
+    for (const [key, gr] of guestRelaysByRoom) {
+      if (key.startsWith(`${home}:`)) {
+        for (const [tok, mapped] of guestRelaysByToken) {
+          if (mapped === gr) guestRelaysByToken.delete(tok);
+        }
+        gr.close();
+        guestRelaysByRoom.delete(key);
+      }
+    }
     const pending = [];
     for (const {timer, stop} of editingTimers.values()) { clearInterval(timer); pending.push(stop()); }
     editingTimers.clear();
     await Promise.allSettled(pending);
   }
 
-  const api = { preview_scope, start_room, join_room, begin_turn, finish_turn, room_status, configure_browser, room_history, end_room,
+  const api = { preview_scope, start_room, join_room, leave_room, revoke_member, revoke_invite, new_invite, verify_email,
+    begin_turn, finish_turn, room_status, configure_browser, room_history, end_room,
     list_draft: a => accessDraft('list',a), read_draft_file: a => accessDraft('read',a),
     write_draft_file: a => accessDraft('write',a), delete_draft_file: a => accessDraft('delete',a) };
   if (desktop) {
@@ -837,7 +1338,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
             draftLocks.set(room,edit); acquired = true;
           }
           const result = await method(args, ...rest);
-          if (name === 'finish_turn' || name === 'end_room' || (acquired && name !== 'begin_turn')) releaseDraft(room);
+          if (name === 'finish_turn' || name === 'end_room' || name === 'leave_room' || (acquired && name !== 'begin_turn')) releaseDraft(room);
           return result;
         } catch (error) {
           if (acquired) releaseDraft(room);
@@ -846,5 +1347,5 @@ export async function openClient(env = process.env, { getRoots = async () => [],
       };
     }
   }
-  return { ...api, close };
+  return { ...api, close, deviceIdentity, home };
 }

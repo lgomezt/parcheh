@@ -1,14 +1,23 @@
 import http from 'node:http';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants, mkdirSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { lstat, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { openDocumentStore } from './document-store.mjs';
+import { openCoordinator } from './coordinator.mjs';
 import { lockProject, prepareProject } from './project-continuity.mjs';
 import { createHistory, scanTree } from './project.mjs';
 import { projectAsset, projectAssetBytes, projectAssetPolicy } from './project-assets.mjs';
 import { invalidDisplayName, normalizeDisplayName } from './display-name.mjs';
+import {
+  verifyAuthToken,
+  normalizeEmail,
+  issueProvisionalEmailToken,
+  issueVerifyChallengeToken,
+  issueDeviceCertificate,
+  verifyDeviceSignature,
+} from './auth-tokens.mjs';
 
 const assets = new Map([
   ['/project.js', 'project.js'],
@@ -22,12 +31,6 @@ const inviteBrandAssets = new Map([
   ['/invite-brand/mark.png', 'image/png'],
   ['/invite-brand/paint.jpg', 'image/jpeg'],
   ['/invite-brand/instrument-sans.ttf', 'font/ttf'],
-]);
-const downloads = new Set([
-  'parcheh-claude-code-macos-arm64.zip',
-  'parcheh-codex-macos-arm64.zip',
-  'parcheh-claude-desktop-macos-arm64.mcpb',
-  'parcheh-antigravity-macos-arm64.zip',
 ]);
 const token = () => randomBytes(32).toString('base64url');
 const fail = (status, message) => Object.assign(new Error(message), {status});
@@ -74,12 +77,15 @@ function sameSecret(a,b) {
   const given=Buffer.from(a), known=Buffer.from(b);
   return given.length===known.length && timingSafeEqual(given,known);
 }
-function peerAddress(req) {
-  const address = req.socket.remoteAddress?.replace(/^::ffff:/,'');
-  return address === '::1' ? '127.0.0.1' : address;
-}
-function checkPeer(record,req) {
-  if (record && record.peer !== peerAddress(req)) throw fail(403,'Tab requires the same device connection.');
+async function rawBody(req, limit = 2048) {
+  if (Number(req.headers['content-length']) > limit) throw fail(413, 'Message exceeds limit.');
+  const chunks = []; let bytes = 0;
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    bytes += chunk.length;
+    if (bytes > limit) throw fail(413, 'Message exceeds limit.');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 function loopback(host) {return ['127.0.0.1','localhost','::1','[::1]'].includes(host);}
 function snapshotBytes({ rev, oid, tree }) {
@@ -169,8 +175,36 @@ export async function startHost(options) {
   }
 }
 
-async function serveHost({source, storage, displayName, deferPublish=false, bind='127.0.0.1',port=0,publicOrigin,releaseDirectory=process.env.PARCHEH_RELEASE_DIR},lock,continuation) {
-  if (bind==='[::1]') bind='::1';
+async function serveHost(options, lock, continuation) {
+  let {
+    source, storage, displayName, deferPublish = false, bind = '127.0.0.1', port = 0, publicOrigin,
+    maxMembers = Number(process.env.PARCHEH_MAX_MEMBERS) || 64, relayOrigin, deviceIdentity, continuityHome,
+    allowGuestInvite,
+    sharingMode = 'instant',
+    allowedEmails = null,
+    allowedDomain = null,
+    trustedAuthPublicKeys = [],
+    onSendEmail = null,
+  } = options;
+
+  if (sharingMode !== undefined && !['instant', 'email', 'restricted'].includes(sharingMode)) {
+    throw new Error("sharingMode must be 'instant', 'email', or 'restricted'.");
+  }
+  if (sharingMode === 'restricted' && !allowedEmails && !allowedDomain) {
+    throw new Error('Restricted rooms require allowedEmails or allowedDomain.');
+  }
+  if (allowGuestInvite === undefined) {
+    allowGuestInvite = sharingMode !== 'restricted';
+  }
+
+  const { loadOrCreateDeviceIdentity } = await import('./device-identity.mjs');
+  const hostIdentity = deviceIdentity || await loadOrCreateDeviceIdentity(continuityHome || dirname(storage));
+
+  const effectiveRelayOrigin = relayOrigin || (process.env.PARCHEH_RELAY_ORIGIN || '').trim() || null;
+  if (effectiveRelayOrigin) {
+    bind = '127.0.0.1';
+  }
+  if (bind === '[::1]') bind = '::1';
   const advertised=publicAddress(bind,publicOrigin);
   const advertiseBoundPort=advertised && new URL(advertised).port==='0';
   if (advertiseBoundPort && !(Number(port)===0 && new URL(advertised).hostname===bind &&
@@ -182,6 +216,7 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
   const tree=continuation?.tree ?? await scanTree(source);
   await mkdir(dirname(storage),{recursive:true,mode:0o700});
   const history=continuation ? await continuation.history(hostName) : await createHistory(storage,tree,hostName);
+  const gitStorage = history.storage || storage;
   let current=await history.head(), config=shareConfig(current.tree), currentBytes=snapshotBytes(current);
   const scopeRev=current.rev, floor=continuation?.floor ?? 1;
   const scopeBaseline=floor>1 ? await history.head(floor) : null;
@@ -213,9 +248,77 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
   }
   let baseUrl, localBaseUrl, sequence=0;
   const scopeRules=Object.fromEntries(Object.entries(tree).filter(([path])=>path.split('/').at(-1)==='.gitignore'));
-  const roomId = randomUUID();
+  let roomId = randomUUID();
   const inviteLifetime = 8 * 60 * 60 * 1000;
   let inviteSecret = token(), expires = Date.now() + inviteLifetime;
+
+  let coordinator;
+  const roomReconnectSecret = randomBytes(32);
+  const relayBridgeSecret = randomBytes(32).toString('base64url');
+  const memberReconnectSecret = (memberId) =>
+    createHmac('sha256', roomReconnectSecret).update(String(memberId)).digest('base64url');
+  let relayTransport = null;
+  let relayIssuerPubKeyHex = null;
+  if (effectiveRelayOrigin) {
+    const { attachHostRelay } = await import('./relay-transport.mjs');
+    relayTransport = await attachHostRelay({
+      relayOrigin: effectiveRelayOrigin,
+      deviceIdentity: hostIdentity,
+      getInviteSecret: () => (!coordinator || coordinator.isInviteRevoked() || Date.now() > expires) ? null : inviteSecret,
+      getReconnectSecret: (memberId) => {
+        if (!coordinator || !coordinator.activeMembers().some(m => m.id === memberId)) return null;
+        return memberReconnectSecret(memberId);
+      },
+      relayBridgeSecret,
+      localPort: () => server.address().port,
+      storage: gitStorage,
+    });
+    relayTransport.storage = gitStorage;
+    roomId = relayTransport.roomId;
+    expires = relayTransport.expiresAt;
+
+    try {
+      const pubKeyRes = await fetch(effectiveRelayOrigin + '/v1/auth/public-key', {
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => null);
+      if (pubKeyRes && pubKeyRes.ok) {
+        const pkData = await pubKeyRes.json().catch(() => null);
+        if (pkData?.issuerPublicKeyHex) relayIssuerPubKeyHex = pkData.issuerPublicKeyHex;
+      }
+    } catch {}
+  }
+
+  coordinator = openCoordinator(resolve(storage) + '.coordinator.sqlite', {
+    roomId,
+    maxMembers,
+    inviteSecret,
+    inviteExpires: expires,
+    allowGuestInvite,
+    sharingMode,
+    allowedEmails,
+    allowedDomain,
+  });
+
+  const syncRelayPolicy = async () => {
+    if (relayTransport?.uploadPolicy) {
+      await relayTransport.uploadPolicy({
+        sharingMode: coordinator.sharingMode(),
+        ...(coordinator.domainHint() && { domainHint: coordinator.domainHint() }),
+      }).catch(() => {});
+    }
+  };
+  await syncRelayPolicy();
+
+  const envTrustedKeys = (process.env.PARCHEH_TRUSTED_AUTH_PUBKEY || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const effectiveTrustedPublicKeys = [
+    relayIssuerPubKeyHex,
+    hostIdentity.publicKeyHex,
+    ...envTrustedKeys,
+    ...(trustedAuthPublicKeys || []),
+  ].filter(Boolean);
   function documentScope(config) {
     const doc=config?.document;
     return doc ? JSON.stringify([doc.id,...[...doc.actions].sort().map(id=>[id,config.payloads[id]])]) : '';
@@ -237,20 +340,20 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
     return documents;
   }
   let assetToken=token();
-  const members=[], grants=new Map(), pointers=new Map(), lastSeen=new Map(), actions=[];
+  const pointers=new Map(), lastSeen=new Map(), actions=[];
   const sharingByMember=new Map(), editing=new Map(), joinReceipts=new Map();
   const handoffs = new Map();
-  const handoffWindow = 10 * 60_000;
-  function liveHandoff(id) {
-    if (typeof id !== 'string' || !/^[0-9a-f]{48}$/.test(id)) throw fail(400,'Invalid tab handoff.');
-    const now = Date.now();
-    for (const [key, record] of handoffs) if (record.expires <= now) handoffs.delete(key);
-    return handoffs.get(id);
+  const inviteUrl = () => (effectiveRelayOrigin ? effectiveRelayOrigin : baseUrl) + '/r/' + roomId + '#' + inviteSecret;
+  async function syncPoster() {
+    if (!relayTransport) return;
+    const preview = invitePreviewBytes(current.tree, config?.invitePreview);
+    if (preview) {
+      await relayTransport.uploadPoster(preview, inviteSecret).catch(() => {});
+    }
   }
-  const inviteUrl=()=>baseUrl+'/r/'+roomId+'#'+inviteSecret;
   const pointerStreams = new Set();
   function visiblePointers(member, now = Date.now()) {
-    if (!sharingByMember.get(member.id).sharing.pointers) return [];
+    if (!sharingByMember.get(member.id)?.sharing.pointers) return [];
     return [...pointers.values()].filter(p => p.memberId !== member.id && p.surface === appSurface()
       && now-p.at < POINTER_TIMEOUT && now-(lastSeen.get(p.memberId) ?? 0) < PEER_TIMEOUT)
       .map(({at, ...pointer}) => pointer);
@@ -258,12 +361,24 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
   function publishPointers() {
     for (const client of pointerStreams) client.send();
   }
+  function cleanupMemberPresence(memberId) {
+    pointers.delete(memberId);
+    lastSeen.delete(memberId);
+    editing.delete(memberId);
+    for (const client of pointerStreams) {
+      if (client.id === memberId) {
+        pointerStreams.delete(client);
+        client.close();
+      }
+    }
+    publishPointers();
+  }
   function streamPointers(member, res) {
     if ([...pointerStreams].filter(client => client.id === member.id).length >= 2)
       throw fail(429,'Too many cursor streams.');
     res.writeHead(200, {'content-type':'application/x-ndjson', 'x-accel-buffering':'no'});
     let blocked = false, last;
-    const client = {id:member.id, send(heartbeat = false) {
+    const client = {id:member.id, close() { if (!res.destroyed) res.end(); }, send(heartbeat = false) {
       if (blocked || res.destroyed) return;
       const snapshot = JSON.stringify({rev:current.rev, pointers:visiblePointers(member)});
       if (last === snapshot && !heartbeat) return;
@@ -284,19 +399,24 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
   const assetPrefix=()=>'/project-assets/'+roomId+'/'+assetToken+'/'+current.rev+'/';
   const entryUrl=()=>Object.hasOwn(current.tree,'index.html') ? assetPrefix()+'index.html' : null;
   const appSurface=()=> 'app:'+(config?.surface ?? 'page')+':'+current.rev;
-  function addMember(name) {
-    if (members.length>=4) throw fail(409,'Room is full.');
-    let label = name;
-    for (let number = 2; members.some(m => m.name.toLowerCase() === label.toLowerCase()); number++) {
-      const suffix = ' ' + number;
-      label = Array.from(name).slice(0, 40 - suffix.length).join('').trimEnd() + suffix;
+  function addMember(name, { email = null, emailVerified = false, deviceKey = null } = {}) {
+    let enrolled;
+    try {
+      enrolled = coordinator.addMember({ name, email, emailVerified, deviceKey });
+    } catch (err) {
+      if (err.status) throw fail(err.status, err.message);
+      throw err;
     }
-    const member={id:randomUUID(),name:label};
-    const memberToken=token(), browserToken=token();
-    members.push(member); grants.set(memberToken,{member,role:'editor'});
-    sharingByMember.set(member.id,{sharing:{pointers:true,actions:true},sharingEpoch:0,sharingActionSeq:sequence});
-    grants.set(browserToken,{member,role:'browser'});
-    return {roomId,memberToken,browserUrl:baseUrl+'/view/'+roomId+'#'+browserToken};
+    sharingByMember.set(enrolled.member.id, { sharing: { pointers: true, actions: true }, sharingEpoch: 0, sharingActionSeq: sequence });
+    return {
+      roomId,
+      memberId: enrolled.member.id,
+      name: enrolled.member.name,
+      memberToken: enrolled.memberToken,
+      ...(effectiveRelayOrigin && { reconnectSecret: memberReconnectSecret(enrolled.member.id) }),
+      browserUrl: baseUrl + '/view/' + roomId + '#' + enrolled.browserToken,
+      ...(email && { email, emailVerified: Boolean(emailVerified), emailStatus: emailVerified ? 'verified' : 'unverified' }),
+    };
   }
   function record(member,msg) {
     if (msg?.kind==='hide-pointer' || msg?.kind==='leave') {
@@ -314,7 +434,7 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
       if (!unit(msg.x) || !unit(msg.y)) throw fail(400,'Invalid pointer.');
       if (!sharing.pointers) throw fail(403,'Pointer sharing is off.');
       lastSeen.set(member.id,Date.now());
-      pointers.set(member.id,{...event,colorIndex:members.indexOf(member),x:msg.x,y:msg.y,at:Date.now()});
+      pointers.set(member.id,{...event,colorIndex:member.colorIndex??0,x:msg.x,y:msg.y,at:Date.now()});
       publishPointers();
       return;
     }
@@ -382,130 +502,248 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
         });
         return res.end(projectAssetBytes(file));
       }
+      const isTopLevelShellNavigation = req.method === 'GET' &&
+        (path === '/r/' + roomId || path === '/view/' + roomId) &&
+        req.headers['sec-fetch-mode'] === 'navigate' &&
+        req.headers['sec-fetch-dest'] === 'document';
+      if (req.headers['sec-fetch-site'] === 'cross-site' && !isTopLevelShellNavigation) {
+        throw fail(403, 'Cross-site request blocked.');
+      }
       if(req.headers.origin && ![baseUrl,localBaseUrl].includes(req.headers.origin)) throw fail(403,'Unknown origin.');
       if(req.method==='GET') {
         if(path==='/r/'+roomId) return await asset(res,'join.html','text/html',shellPolicy + "; img-src 'self' blob:; font-src 'self'");
         if(inviteBrandAssets.has(path)) return await asset(res,path.slice(1),inviteBrandAssets.get(path),shellPolicy);
-        if (path === '/downloads') {
-          const files = releaseDirectory ? await Promise.all([...downloads].map(async name => {
-            const stat = await lstat(join(releaseDirectory, name)).catch(() => null);
-            return stat?.isFile() && stat.size > 0 ? name : null;
-          })) : [];
-          return json({ files: files.filter(Boolean) });
-        }
-        if(path.startsWith('/downloads/')) {
-          const name=path.slice('/downloads/'.length);
-          if(!releaseDirectory || !downloads.has(name)) throw fail(404,'Unknown download.');
-          let file;
-          try { file=await open(join(releaseDirectory,name),constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-          catch { throw fail(404,'Download unavailable.'); }
-          try {
-            const info=await file.stat();
-            if(!info.isFile()) throw fail(404,'Download unavailable.');
-            holdResponse(res,info.size);
-            res.writeHead(200,{'content-type':'application/octet-stream','content-length':info.size,
-              'content-disposition':'attachment; filename="'+name+'"'});
-            await pipeline(file.createReadStream({autoClose:false}),res);
-          } finally { await file.close(); }
-          return;
-        }
         if(path==='/view/'+roomId) return await asset(res,'project.html','text/html',shellPolicy);
         if(assets.has(path)) return await asset(res,assets.get(path),'text/javascript',shellPolicy);
       }
       if (req.method === 'GET' && /^\/api\/rooms\/[^/]+\/invite-preview$/.test(path)) {
         const secret = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
         if (path !== '/api/rooms/' + roomId + '/invite-preview' ||
-            Date.now() > expires || !sameSecret(secret, inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+            !coordinator.checkInvite(secret)) throw fail(403,'Invalid or expired invitation.');
         const preview = invitePreviewBytes(current.tree, config?.invitePreview);
         if (!preview) return res.writeHead(204).end();
         holdResponse(res, preview.length);
         return res.writeHead(200, {'content-type':'image/png','content-length':preview.length}).end(preview);
       }
+      if (req.method === 'GET' && path === '/api/auth/public-key') {
+        return json({ issuerPublicKeyHex: hostIdentity.publicKeyHex });
+      }
+      if (req.method === 'POST' && path === '/api/auth/provisional') {
+        const body = await jsonBody(req);
+        const email = normalizeEmail(body?.email);
+        if (!email) throw fail(400, 'Valid email address is required.');
+        const claimToken = issueProvisionalEmailToken({ email }, hostIdentity.privateKey);
+        return json({ ok: true, claimToken, email });
+      }
+      if (req.method === 'POST' && path === '/api/auth/request-verify') {
+        const body = await jsonBody(req);
+        const email = normalizeEmail(body?.email);
+        const devicePublicKeyHex = String(body?.devicePublicKeyHex || '').trim().toLowerCase();
+        if (!email) throw fail(400, 'Valid email address is required.');
+        if (!/^[0-9a-f]{64}$/.test(devicePublicKeyHex)) throw fail(400, 'Valid devicePublicKeyHex is required.');
+        const code = String(Math.floor(100000 + Math.random() * 900000));
+        const challengeToken = issueVerifyChallengeToken({ email, devicePublicKeyHex, code }, hostIdentity.privateKey);
+        const expiresAt = Date.now() + 15 * 60_000;
+        if (typeof onSendEmail === 'function') {
+          await onSendEmail({ email, code, challengeToken });
+        } else if (process.env.PARCHEH_RESEND_API_KEY) {
+          try {
+            await fetch('https://api.resend.com/emails', {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${process.env.PARCHEH_RESEND_API_KEY}`,
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify({
+                from: 'parcheh <verify@parcheh.augi.ca>',
+                to: [email],
+                subject: `Your parcheh verification code: ${code}`,
+                text: `Your 6-digit verification code is: ${code}\n\nThis code will expire in 15 minutes.`,
+              }),
+            });
+          } catch {
+            throw fail(502, 'Email verification delivery failed.');
+          }
+        } else {
+          throw fail(503, 'Email verification delivery is not configured.');
+        }
+        return json({ ok: true, challengeToken, expiresAt });
+      }
+      if (req.method === 'POST' && path === '/api/auth/complete-verify') {
+        const body = await jsonBody(req);
+        const email = normalizeEmail(body?.email);
+        const code = String(body?.code || '').trim();
+        const challengeToken = String(body?.challengeToken || '').trim();
+        const devicePublicKeyHex = String(body?.devicePublicKeyHex || '').trim().toLowerCase();
+        const proofSigHex = String(body?.proofSigHex || '').trim();
+        if (!email || !code || !challengeToken || !devicePublicKeyHex || !proofSigHex) {
+          throw fail(400, 'email, code, challengeToken, devicePublicKeyHex, and proofSigHex are required.');
+        }
+        const verification = verifyAuthToken(challengeToken, [hostIdentity.publicKeyHex]);
+        if (!verification.valid || verification.payload?.kind !== 'verify_challenge') {
+          throw fail(400, verification.reason || 'Invalid challenge token.');
+        }
+        const challenge = verification.payload;
+        if (challenge.email !== email || challenge.devicePublicKeyHex !== devicePublicKeyHex) {
+          throw fail(400, 'Challenge parameters mismatch.');
+        }
+        const codeHash = createHash('sha256').update(code).digest('hex');
+        if (codeHash !== challenge.codeHash) {
+          throw fail(400, 'Invalid verification code.');
+        }
+        const proofPayload = Buffer.from('parcheh-verify:' + email + ':' + code + ':' + challengeToken, 'utf8');
+        let sigValid = false;
+        try {
+          sigValid = verifyDeviceSignature(devicePublicKeyHex, proofPayload, proofSigHex);
+        } catch {}
+        if (!sigValid) {
+          throw fail(403, 'Invalid device proof signature.');
+        }
+        const deviceCertificate = issueDeviceCertificate({ email, devicePublicKeyHex }, hostIdentity.privateKey);
+        return json({ ok: true, deviceCertificate, email, devicePublicKeyHex });
+      }
       const prefix='/api/rooms/'+roomId+'/';
       if (!path.startsWith(prefix)) throw fail(404,'Unknown room or endpoint.');
       const route=path.slice(prefix.length);
-      if (!published && !['status','scope','snapshot','sharing','close','host-ready'].includes(route)) {
+      if (req.method === 'GET' && route === 'policy') {
+        return json({ sharingMode: coordinator.sharingMode(), domainHint: coordinator.domainHint() });
+      }
+      if (!published && !['status','scope','snapshot','sharing','close','host-ready','policy'].includes(route)) {
         throw fail(503,'The host workspace is still opening.');
       }
-      if (['tab-register','tab-receive','tab-ack'].includes(route) && req.method === 'POST') {
-        const msg = await jsonBody(req);
-        fields(msg, ['id','receipt'],route === 'tab-register' ? [] : ['claim']);
-        if (route !== 'tab-register' && !/^[a-f0-9]{48}$/.test(msg.claim)) throw fail(400,'Invalid tab claim.');
-        const secret = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
-        if (Date.now() > expires || !sameSecret(secret, inviteSecret)) throw fail(403,'Invalid or expired invitation.');
-        if (typeof msg.receipt !== 'string' || !/^[a-f0-9]{64}$/.test(msg.receipt)) throw fail(400,'Invalid receipt.');
-        let record = liveHandoff(msg.id);
-        checkPeer(record,req);
-        if (route === 'tab-register' && !record) {
-          if (handoffs.size >= 512) throw fail(429,'Too many waiting tabs.');
-          record = {receipt:msg.receipt, peer:peerAddress(req), expires:Date.now()+handoffWindow};
-          handoffs.set(msg.id,record);
-        }
-        if (!record) throw fail(410,'Expired tab handoff.');
-        if (!sameSecret(msg.receipt,record.receipt)) throw fail(403,'Invalid receipt.');
-        if (record.claim && record.claim !== msg.claim && route !== 'tab-register') throw fail(409,'Tab grant already claimed.');
-        if (route === 'tab-ack' && record.claim === msg.claim) {
-          record.delivered = true;
-          delete record.browserToken;
-          delete record.app;
-          record.expires = Math.min(expires,Date.now()+handoffWindow);
-        }
-        if (route === 'tab-receive' && record.member && !record.delivered) {
-          if (!record.claim) {
-            record.claim = msg.claim;
-            record.browserToken = token();
-            grants.set(record.browserToken,{member:record.member,role:'browser'});
+      const handoffMatch = /^handoffs\/([0-9a-f]{64})$/.exec(route);
+      if (handoffMatch) {
+        const handoffId = handoffMatch[1];
+        if (req.method === 'GET') {
+          const secret = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+          if (!coordinator.checkInvite(secret)) throw fail(403, 'Invalid or expired invitation.');
+          const item = handoffs.get(handoffId);
+          if (!item || Date.now() > item.expiresAt) {
+            if (item) handoffs.delete(handoffId);
+            return res.writeHead(204).end();
           }
-          if (record.browserToken) return json({browserToken:record.browserToken,...(record.app && {app:record.app})});
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': item.data.length,
+          });
+          return res.end(item.data);
         }
-        return json({expires:record.expires});
+        if (req.method === 'PUT') {
+          const rawToken = (req.headers.authorization || '').replace(/^Bearer /, '');
+          const grant = coordinator.verifyGrant(rawToken);
+          if (!req.headers.authorization?.startsWith('Bearer ') || !grant) throw fail(403, 'Room credential required.');
+          if (grant.revoked) throw fail(403, 'Participant has been revoked or left the room.');
+          if (grant.role !== 'editor') throw fail(403, 'Wrong credential for this operation.');
+          if (coordinator.isInviteRevoked() || Date.now() > expires) throw fail(403, 'Invitation has been revoked or expired.');
+          const bytes = await rawBody(req, 2048);
+          if (bytes.length === 0) throw fail(400, 'Empty handoff body.');
+          const now = Date.now();
+          for (const [id, item] of handoffs) {
+            if (now > item.expiresAt) handoffs.delete(id);
+          }
+          if (handoffs.size >= 256) {
+            handoffs.delete(handoffs.keys().next().value);
+          }
+          handoffs.set(handoffId, { data: bytes, expiresAt: now + 10 * 60_000 });
+          return res.writeHead(204).end();
+        }
+        throw fail(405, 'Method not allowed.');
       }
       if(route==='join' && req.method==='POST'){
-        const msg=await jsonBody(req); fields(msg,['inviteSecret','displayName'],['requestId','handoff']);
-        if (Date.now()>expires||!sameSecret(msg.inviteSecret,inviteSecret)) throw fail(403,'Invalid or expired invitation.');
-        const tab = msg.handoff !== undefined ? liveHandoff(msg.handoff) : null;
-        checkPeer(tab,req);
-        if (msg.handoff !== undefined && !tab) throw fail(410,'Expired tab handoff.');
-        if (tab && (!msg.requestId || (tab.requestId && tab.requestId !== msg.requestId) || tab.member)) {
-          throw fail(409,'Tab already admitted.');
+        const msg=await jsonBody(req);
+        fields(msg,['inviteSecret','displayName'],['requestId','handoff','claimToken','deviceCertificate','guestEdPubHex','joinProofNonce','joinProofSigHex','email']);
+        if (!coordinator.checkInvite(msg.inviteSecret)) throw fail(403,'Invalid or expired invitation.');
+
+        let authenticatedGuestEdPubHex = null;
+        if (relayTransport && sameSecret(req.headers['x-parcheh-relay-bridge'], relayBridgeSecret)) {
+          const peerHeader = req.headers['x-parcheh-peer-ed25519'];
+          if (typeof peerHeader === 'string' && /^[0-9a-f]{64}$/i.test(peerHeader)) {
+            authenticatedGuestEdPubHex = peerHeader.toLowerCase();
+          }
         }
+        if (!authenticatedGuestEdPubHex && msg.guestEdPubHex && msg.joinProofNonce && msg.joinProofSigHex) {
+          const signBuf = Buffer.from(`${roomId}:${msg.requestId || ''}:${msg.joinProofNonce}`, 'utf8');
+          try {
+            if (verifyDeviceSignature(msg.guestEdPubHex, signBuf, msg.joinProofSigHex)) {
+              authenticatedGuestEdPubHex = String(msg.guestEdPubHex).toLowerCase();
+            }
+          } catch {}
+        }
+
+        let verifiedCert = null;
+        let provisionalClaim = null;
+        if (msg.deviceCertificate) {
+          const res = verifyAuthToken(msg.deviceCertificate, effectiveTrustedPublicKeys);
+          if (
+            res.valid &&
+            res.payload?.kind === 'device_email_cert' &&
+            res.payload.verified === true &&
+            authenticatedGuestEdPubHex &&
+            res.payload.devicePublicKeyHex?.toLowerCase() === authenticatedGuestEdPubHex
+          ) {
+            verifiedCert = res.payload;
+          }
+        }
+        if (msg.claimToken) {
+          const res = verifyAuthToken(msg.claimToken, effectiveTrustedPublicKeys);
+          if (res.valid && res.payload?.kind === 'provisional_email') {
+            provisionalClaim = res.payload;
+          }
+        }
+
+        const mode = coordinator.sharingMode();
+        let memberEmail = null;
+        let memberEmailVerified = false;
+
+        if (mode === 'instant') {
+          if (verifiedCert) {
+            memberEmail = verifiedCert.email;
+            memberEmailVerified = true;
+          } else if (provisionalClaim) {
+            memberEmail = provisionalClaim.email;
+            memberEmailVerified = false;
+          }
+        } else if (mode === 'email') {
+          if (verifiedCert) {
+            memberEmail = verifiedCert.email;
+            memberEmailVerified = true;
+          } else if (provisionalClaim) {
+            memberEmail = provisionalClaim.email;
+            memberEmailVerified = false;
+          } else {
+            throw fail(403, 'Enter an email address to join this room.');
+          }
+        } else if (mode === 'restricted') {
+          if (!verifiedCert) {
+            throw fail(403, 'Verified email certificate required for this restricted room.');
+          }
+          if (!authenticatedGuestEdPubHex || verifiedCert.devicePublicKeyHex.toLowerCase() !== authenticatedGuestEdPubHex.toLowerCase()) {
+            throw fail(403, 'Verified email certificate required for this restricted room.');
+          }
+          if (!coordinator.isEmailAllowed(verifiedCert.email)) {
+            throw fail(403, 'Your verified email is not on the guest list for this restricted room.');
+          }
+          memberEmail = verifiedCert.email;
+          memberEmailVerified = true;
+        }
+
         const name=nameOf(msg.displayName);
-        if(msg.requestId===undefined) return json(addMember(name));
+        if(msg.requestId===undefined) return json(addMember(name, { email: memberEmail, emailVerified: memberEmailVerified, deviceKey: authenticatedGuestEdPubHex }));
         if(typeof msg.requestId!=='string' || !uuid.test(msg.requestId)) throw fail(400,'Invalid join request ID.');
         const key=msg.requestId.toLowerCase();
         const previous=joinReceipts.get(key);
         if(previous && previous.name!==name) throw fail(409,'This join request already belongs to another name.');
-        if(previous) {
-          if (tab) tab.requestId = key;
-          return json(previous.receipt);
-        }
-        const receipt=addMember(name);
-        if (tab) tab.requestId = key;
+        if(previous) return json(previous.receipt);
+        const receipt=addMember(name, { email: memberEmail, emailVerified: memberEmailVerified, deviceKey: authenticatedGuestEdPubHex });
         joinReceipts.set(key,{name,receipt});
         return json(receipt);
       }
-      const grant=grants.get((req.headers.authorization||'').replace(/^Bearer /,''));
-      if (!req.headers.authorization?.startsWith('Bearer ')||!grant) throw fail(403,'Room credential required.');
+      const rawToken = (req.headers.authorization || '').replace(/^Bearer /, '');
+      const grant = coordinator.verifyGrant(rawToken);
+      if (!req.headers.authorization?.startsWith('Bearer ') || !grant) throw fail(403, 'Room credential required.');
+      if (grant.revoked) throw fail(403, 'Participant has been revoked or left the room.');
       const browser=['activity','live','pointers','config','document','invite'].includes(route);
       if (grant.role!==(browser?'browser':'editor')) throw fail(403,'Wrong credential for this operation.');
-      if (route === 'tab-confirm' && req.method === 'POST') {
-        const msg = await jsonBody(req);
-        fields(msg,['id','inviteSecret'],['app']);
-        if (Date.now() > expires || !sameSecret(msg.inviteSecret,inviteSecret)) throw fail(403,'Invalid or expired invitation.');
-        const record = liveHandoff(msg.id);
-        if (!record) throw fail(410,'Expired tab handoff.');
-        checkPeer(record,req);
-        if (record.requestId && joinReceipts.get(record.requestId)?.receipt.memberToken !== req.headers.authorization.slice(7)) throw fail(409,'Tab already admitted.');
-        if (record.member && record.member !== grant.member) throw fail(409,'Tab already admitted.');
-        let app;
-        if (msg.app !== undefined) {
-          try { app = new URL(msg.app); } catch { throw fail(400,'Invalid local preview.'); }
-          if (!['http:','https:'].includes(app.protocol) || !['127.0.0.1','localhost'].includes(app.hostname) ||
-              app.username || app.password || app.hash || [baseUrl,localBaseUrl].includes(app.origin)) throw fail(400,'Invalid local preview.');
-        }
-        if (!record.member) Object.assign(record,{member:grant.member,expires,...(app && {app:app.href})});
-        return json({confirmed:true});
-      }
       if (req.method==='GET') {
         if(route==='snapshot') {
           holdResponse(res,currentBytes);
@@ -519,7 +757,11 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
           return json({entries});
         }
         const settings=sharingByMember.get(grant.member.id);
-        if(route==='invite') return json({inviteUrl:inviteUrl()});
+        if(route==='invite') {
+          if (!coordinator.canMemberInvite(grant.member.id)) throw fail(403, 'Only the host can share invitations for this room.');
+          if (coordinator.isInviteRevoked()) throw fail(403, 'Invitation has been revoked.');
+          return json({inviteUrl:inviteUrl()});
+        }
         if(route==='document') {
           const doc=documentAccess(grant.member,url.searchParams.get('documentId'));
           const cursor=url.searchParams.get('after');
@@ -527,7 +769,7 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
           return json(documentStore().read(doc.id,Number(cursor)));
         }
         if(route==='status') return json({
-          roomId,rev:current.rev,oid:current.oid,members,previewAvailable:!!entryUrl(),
+          roomId,rev:current.rev,oid:current.oid,members:coordinator.activeMembers(),previewAvailable:!!entryUrl(),
           browserMode:entryUrl() ? 'project' : 'source-only',sharing:settings.sharing,
         });
         if(route==='config') return json({rev:current.rev,config,entryUrl:entryUrl(),sharing:settings.sharing});
@@ -538,35 +780,94 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
           if(now-(lastSeen.get(grant.member.id)??0)>=PEER_TIMEOUT) pointers.delete(grant.member.id);
           lastSeen.set(grant.member.id,now);
           for(const [id,lease] of editing) if(lease.expires<=now) editing.delete(id);
-          const peers=members.filter(m=>m.id!==grant.member.id && now-(lastSeen.get(m.id)??0)<PEER_TIMEOUT);
+          const activeMembers = coordinator.activeMembers();
+          const peers=activeMembers.filter(m=>m.id!==grant.member.id && now-(lastSeen.get(m.id)??0)<PEER_TIMEOUT);
           return json({
             rev:current.rev,self:grant.member,peers,...settings,actionSeq:sequence,
             documentHead:settings.sharing.actions && config?.document ? documentStore().head(config.document.id) : 0,
-            editing:members.filter(m=>editing.has(m.id)).map(m=>({memberId:m.id,name:m.name})),
+            editing:activeMembers.filter(m=>editing.has(m.id)).map(m=>({memberId:m.id,name:m.name})),
             actions:settings.sharing.actions ? actions.filter(e=>e.seq>settings.sharingActionSeq && e.surface===surface) : [],
             pointers:visiblePointers(grant.member,now),
           });
         }
       }
       if (req.method==='POST' && route==='host-ready') {
-        if (grant.member!==members[0]) throw fail(403,'Only the host can finish room setup.');
+        if (grant.member.id!==coordinator.getHostMemberId()) throw fail(403,'Only the host can finish room setup.');
         fields(await jsonBody(req),[]);
         activate();
         return json({ready:true});
       }
       if (req.method === 'POST' && route === 'host-invite') {
-        if (grant.member !== members[0]) throw fail(403,'Only the host can renew an invitation.');
+        if (grant.member.id !== coordinator.getHostMemberId()) throw fail(403,'Only the host can renew an invitation.');
         fields(await jsonBody(req),[]);
-        if (Date.now() > expires) {
+        if (Date.now() > expires || coordinator.isInviteRevoked()) {
           inviteSecret = token();
           expires = Date.now() + inviteLifetime;
+          coordinator.newInvite(grant.member.id, inviteSecret, expires);
+          await syncPoster();
         }
         return json({inviteUrl:inviteUrl()});
       }
       if(req.method==='POST' && route==='close'){
-        if(grant.member.id!==members[0].id) throw fail(403,'Only the host can close the room.');
+        if(grant.member.id!==coordinator.getHostMemberId()) throw fail(403,'Only the host can close the room.');
         fields(await jsonBody(req),[]);
         res.once('finish',()=>{setImmediate(close);}); return json({closed:true});
+      }
+      if(req.method==='POST' && route==='leave'){
+        fields(await jsonBody(req),[]);
+        let result;
+        try { result = coordinator.leaveRoom(grant.member.id); }
+        catch (e) { throw fail(e.status || 400, e.message); }
+        cleanupMemberPresence(grant.member.id);
+        return json({ left: true, roomId });
+      }
+      if(req.method==='POST' && route==='revoke-member'){
+        const msg=await jsonBody(req);
+        fields(msg,['member']);
+        if(typeof msg.member!=='string'||!msg.member.trim()) throw fail(400,'Invalid member identifier.');
+        let result;
+        try { result = coordinator.revokeMember(msg.member, grant.member.id); }
+        catch (e) { throw fail(e.status || 400, e.message); }
+        cleanupMemberPresence(result.revoked.id);
+        if (relayTransport) {
+          relayTransport.rotateGroupKeyAndKick({ revokedMemberId: result.revoked.id, newEpoch: result.groupKeyEpoch });
+        }
+        return json(result);
+      }
+      if(req.method==='POST' && route==='revoke-invite'){
+        fields(await jsonBody(req),[]);
+        let result;
+        try { result = coordinator.revokeInvite(grant.member.id); }
+        catch (e) { throw fail(e.status || 400, e.message); }
+        return json(result);
+      }
+      if(req.method==='POST' && route==='new-invite'){
+        const body = await jsonBody(req);
+        fields(body,[],['sharingMode','allowedEmails','allowedDomain','allowGuestInvite']);
+        const nextSecret = token();
+        const nextExpires = Date.now() + inviteLifetime;
+        try {
+          coordinator.newInvite(grant.member.id, nextSecret, nextExpires, {
+            sharingMode: body.sharingMode,
+            allowedEmails: body.allowedEmails,
+            allowedDomain: body.allowedDomain,
+            allowGuestInvite: body.allowGuestInvite,
+          });
+        }
+        catch (e) { throw fail(e.status || 400, e.message); }
+        inviteSecret = nextSecret;
+        expires = nextExpires;
+        await syncPoster();
+        await syncRelayPolicy();
+        return json({ inviteUrl: inviteUrl() });
+      }
+      if(req.method==='POST' && route==='claim-email'){
+        const body = await jsonBody(req);
+        fields(body,['email']);
+        const email = normalizeEmail(body.email);
+        if(!email) throw fail(400, 'Valid email address is required.');
+        coordinator.updateMemberEmail(grant.member.id, email, false);
+        return json({ ok: true, email });
       }
       if(req.method==='POST' && route==='editing'){
         const msg=await jsonBody(req);
@@ -591,6 +892,29 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
       if(req.method==='POST' && route==='activity'){
         record(grant.member,await jsonBody(req)); return json({ok:true});
       }
+      if (req.method === 'POST' && route === 'pack') {
+        const msg = await jsonBody(req, 16384);
+        fields(msg, [], ['wantOid', 'haveOids']);
+        const targetOid = msg.wantOid ?? current.oid;
+        if (typeof targetOid !== 'string' || !/^[0-9a-f]{40}$/.test(targetOid)) {
+          throw fail(400, 'Invalid wantOid.');
+        }
+        const haves = Array.isArray(msg.haveOids) ? msg.haveOids : [];
+        if (haves.some(h => typeof h !== 'string' || !/^[0-9a-f]{40}$/.test(h))) {
+          throw fail(400, 'Invalid haveOids.');
+        }
+        const { exportPack } = await import('./git-pack.mjs');
+        const packBuf = await exportPack(gitStorage, targetOid, haves);
+        holdResponse(res, packBuf.length);
+        if (req.headers.accept === 'application/octet-stream') {
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': packBuf.length,
+          });
+          return res.end(packBuf);
+        }
+        return json({ rev: current.rev, oid: current.oid, packBase64: packBuf.toString('base64') });
+      }
       if(req.method==='POST' && route==='submit'){
         const length=Number(req.headers['content-length'] ?? MAX_SUBMIT_BYTES);
         if(length>MAX_SUBMIT_BYTES) throw fail(413,'Message exceeds limit.');
@@ -601,13 +925,19 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
           let receipt;
           try { receipt=await history.submit({...msg,author:grant.member.name},{scopeRev, minimumRev:floor, excluded:continuation?.excluded, originalRules:continuation?.originalRules}); }
           catch { throw fail(409,'Submission rejected. Check the base, changed paths, and submission ID.'); }
+          coordinator.recordRevision({ rev: receipt.rev, oid: receipt.oid, actor: grant.member.name, submissionId: msg.id });
           if(receipt.rev>current.rev){
+            const priorOid = current.oid;
             const head=await history.head();
             if(head.rev>current.rev){
               current=head;config=shareConfig(head.tree);currentBytes=snapshotBytes(head);
               scope=documentScope(config);
               refreshDocuments();
               assetToken=token();pointers.clear();actions.length=0;publishPointers();
+            }
+            if (relayTransport) {
+              await relayTransport.broadcastRevision({ rev: receipt.rev, oid: receipt.oid, prevOid: priorOid }).catch(() => {});
+              await syncPoster();
             }
           }
           return json(receipt);
@@ -640,6 +970,7 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
         (action,payload)=>validatedPayload(config,action,payload));
     }
     if (!deferPublish) activate();
+    await syncPoster();
   } catch (error) {
     documents?.close();
     await new Promise(done=>server.close(done));
@@ -655,7 +986,9 @@ async function serveHost({source, storage, displayName, deferPublish=false, bind
     clearTimeout(setupTimer);
     clearTimeout(expiryTimer);
     clearInterval(pointerHeartbeat);
+    relayTransport?.closeRelayRoom();
     server.close(async()=>{
+      coordinator.close();
       documents?.close();
       documents=undefined;
       try { if (!published) await continuation?.discard(); } finally {
