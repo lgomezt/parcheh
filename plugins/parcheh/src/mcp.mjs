@@ -25,10 +25,12 @@ const tools = [
   },
   {
     name: 'start_room',
-    description: 'Share a selected project directory in a new parcheh room. Returns the invitation, browser link and local accepted workspace.',
+    description: 'Share a selected project directory or create a brand-new empty project in a parcheh room. Returns the invitation, browser link and local accepted workspace.',
     properties: {
       continueFromRoom: {type:"string", description:"Explicitly fork a previous room hosted here. Use for older saved rooms with a verified local host history or to select an earlier branch."},
       source: path,
+      newProject: { type: 'boolean', description: 'Create a fresh empty project folder automatically and start the room immediately without prompting for a folder.' },
+      projectName: { type: 'string', minLength: 1, description: 'Optional short folder name when newProject is true.' },
       workspaceParent: path,
       displayName: name,
       sharingMode: { type: 'string', description: 'Progressive sharing policy: instant (zero friction, default), email (provisional unverified), or restricted (verified email required).' },

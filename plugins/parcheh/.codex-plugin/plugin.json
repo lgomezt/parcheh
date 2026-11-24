@@ -1,6 +1,6 @@
 {
   "name": "parcheh",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Collaborate on one project from your own coding agent, with live edits and shared cursors.",
   "author": {
     "name": "parcheh"
@@ -10,6 +10,8 @@
   "interface": {
     "displayName": "parcheh",
     "shortDescription": "Collaborate on one project from your own coding agent, with live edits and shared cursors.",
-    "category": "Productivity"
+    "category": "Productivity",
+    "composerIcon": "./codex-skills/parcheh/assets/mark.png",
+    "logo": "./codex-skills/parcheh/assets/mark.png"
   }
 }

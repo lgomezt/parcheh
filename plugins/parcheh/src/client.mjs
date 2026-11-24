@@ -273,7 +273,7 @@ export async function openClient(env = process.env, { getRoots = async () => [],
   }
   async function sourceRoots() {
     if (root) return [root];
-    const paths = [...await getRoots(), env.CLAUDE_PROJECT_DIR].filter(Boolean);
+    const paths = [...await getRoots(), env.CLAUDE_PROJECT_DIR, env.PARCHEH_PROJECT_DIR].filter(Boolean);
     const roots = [];
     for (const path of paths) {
       try {
@@ -284,9 +284,38 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     }
     return [...new Set(roots)];
   }
+  async function createStarterProject(projectName) {
+    const base = env.PARCHEH_NEW_PROJECTS_DIR
+      ? resolve(env.PARCHEH_NEW_PROJECTS_DIR)
+      : (env.PARCHEH_HOME ? join(dirname(home), 'parcheh-projects') : join(homedir(), 'Documents', 'parcheh'));
+    if (inside(base, home) || inside(home, base)) {
+      throw new Error('New project storage must be outside PARCHEH_HOME.');
+    }
+    await mkdir(base, { recursive: true, mode: 0o700 });
+    const slug = (projectName || 'parcheh')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 32) || 'parcheh';
+    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const folder = join(base, `${slug}-${stamp}-${randomUUID().slice(0, 6)}`);
+    await mkdir(folder, { mode: 0o700 });
+    const canonical = await realpath(folder);
+    checkSourceRoot(canonical);
+    return canonical;
+  }
   let pickedProject;
   async function chooseSource(input) {
     const roots = await sourceRoots();
+    if (desktop && !roots.length && input && env.PARCHEH_TRUST_SOURCE_ARG === '1') {
+      const candidate = await existingDirectory(input, 'Source');
+      checkSourceRoot(candidate);
+      if (inside(candidate, home) || inside(home, candidate)) {
+        throw new Error('Choose a project outside private room storage.');
+      }
+      return candidate;
+    }
     if (desktop && !roots.length && env.PARCHEH_DESKTOP_PICKER !== '0') {
       if (!pickedProject || (input && !inside(pickedProject, resolve(input)))) {
         const selected = await existingDirectory(await pickProject(), 'Selected project');
@@ -580,15 +609,18 @@ export async function openClient(env = process.env, { getRoots = async () => [],
     return local;
   }
 
-  async function start_room({ source, continueFromRoom, workspaceParent, displayName, pointers, actions, openPreview, allowGuestInvite, sharingMode, allowedEmails, allowedDomain }, progress = () => {}) {
+  async function start_room({ source, newProject, projectName, continueFromRoom, workspaceParent, displayName, pointers, actions, openPreview, allowGuestInvite, sharingMode, allowedEmails, allowedDomain }, progress = () => {}) {
     if (sharingMode !== undefined && !['instant', 'email', 'restricted'].includes(sharingMode)) {
       throw new Error("sharingMode must be 'instant', 'email', or 'restricted'.");
     }
     if (sharingMode === 'restricted' && !allowedEmails && !allowedDomain) {
       throw new Error('Restricted rooms require allowedEmails or allowedDomain.');
     }
+    if (newProject && (source || continueFromRoom)) {
+      throw new Error('Use either newProject or an existing source folder, not both.');
+    }
     const name = entryDisplayName(displayName);
-    const selected = await chooseSource(source);
+    const selected = newProject ? await createStarterProject(projectName) : await chooseSource(source);
     if (inside(selected, home) || inside(home, selected)) throw new Error('The source must exclude PARCHEH_HOME.');
     const parent = await chooseWorkspace(workspaceParent);
     const lan = desktop && allowLanHttp && !env.PARCHEH_BIND ? desktopAddress() : null;

@@ -1,0 +1,4 @@
+interface:
+  display_name: "parcheh"
+  icon_small: "./assets/mark.png"
+  icon_large: "./assets/mark.png"

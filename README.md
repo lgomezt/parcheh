@@ -33,7 +33,7 @@ The plugin bundles Node.js and uses your Mac’s Git. macOS may ask you to insta
 
 ### Antigravity
 
-Ask your host for the experimental Antigravity kit and unzip it. In Antigravity’s MCP settings, add the `parcheh` entry from the kit’s `mcp_config.json`. Replace `${PLUGIN_ROOT}` with the full path to the extracted `parcheh` folder. Then open the invitation and choose **Antigravity**. [Antigravity MCP settings](https://antigravity.google/docs/mcp/)
+Download `parcheh-antigravity-macos-arm64.zip` from the [latest release](https://github.com/lgomezt/parcheh/releases/latest) and unzip it. To install the skill and MCP server together, run `agy plugin install /full/path/to/parcheh` with the path to the extracted folder. If you only use Antigravity’s MCP settings, add the `parcheh` entry from `mcp_config.json` and replace `${PLUGIN_ROOT}` with that same path. Then open the invitation and choose **Antigravity**. [Antigravity plugin guide](https://antigravity.google/docs/cli/plugins)
 
 ### Other coding tools
 
